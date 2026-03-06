@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: daily_active_users
+    description: Daily active users by product surface
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - activity_date
+            - user_id
+    columns:
+      - name: activity_date
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
+  - name: daily_active_users_all
+    description: Daily active users including employees
+  - name: dim_users
+    description: User dimension

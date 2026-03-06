@@ -1,0 +1,13 @@
+tables:
+  - name: orders_by_day
+    description: Daily order facts
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - order_date
+            - user_id
+    columns:
+      - name: order_date
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
