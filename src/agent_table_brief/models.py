@@ -73,6 +73,17 @@ class MaintenanceResult(BaseModel):
     scans_removed: int
 
 
+class SearchHit(BaseModel):
+    table: str
+    rank: float
+    brief: TableBrief
+
+
+class SearchResult(BaseModel):
+    query: str
+    hits: list[SearchHit]
+
+
 class CliError(BaseModel):
     code: str
     message: str

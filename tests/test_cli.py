@@ -320,5 +320,133 @@ def test_export_markdown_includes_field_confidence(tmp_path: Path) -> None:
     assert "Field Confidence" in result.stdout
 
 
+def test_search_json_returns_ranked_results(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "search",
+            "daily active users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["query"] == "daily active users"
+    assert len(payload["hits"]) > 0
+    tables = [hit["table"] for hit in payload["hits"]]
+    assert any("daily_active_users" in t for t in tables)
+
+
+def test_search_markdown_output(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "search",
+            "daily active users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "markdown",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "# Search:" in result.stdout
+    assert "result(s)" in result.stdout
+
+
+def test_search_no_results(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "search",
+            "zzzznonexistenttermzzzz",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["hits"]) == 0
+
+
+def test_search_with_limit(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "search",
+            "users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--limit",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["hits"]) <= 1
+
+
+def test_search_unscanned_repo_returns_error(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    unknown_repo = tmp_path / "empty"
+    unknown_repo.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "search",
+            "orders",
+            "--repo",
+            str(unknown_repo),
+            "--store",
+            str(store_path),
+        ],
+    )
+    assert result.exit_code == 1
+    error = json.loads(result.stderr)
+    assert error["code"] == "repo_not_scanned"
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)

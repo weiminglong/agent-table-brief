@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from agent_table_brief.models import Catalog, CompareResult, EvidenceRef, TableBrief
+from agent_table_brief.models import Catalog, CompareResult, EvidenceRef, SearchResult, TableBrief
 
 
 def render_brief_json(brief: TableBrief) -> str:
@@ -76,6 +76,29 @@ def render_compare_markdown(result: CompareResult) -> str:
     lines.append("")
     for entry in result.tables:
         lines.append(render_brief_markdown(entry.brief))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def render_search_json(result: SearchResult) -> str:
+    return result.model_dump_json(indent=2)
+
+
+def render_search_markdown(result: SearchResult) -> str:
+    lines = [f"# Search: {result.query}", ""]
+    if not result.hits:
+        lines.append("No results found.")
+        return "\n".join(lines).strip()
+    lines.append(f"{len(result.hits)} result(s)")
+    lines.append("")
+    for i, hit in enumerate(result.hits, 1):
+        purpose = hit.brief.purpose or "unknown"
+        lines.append(f"## {i}. {hit.table}")
+        lines.append(f"- Purpose: {purpose}")
+        if hit.brief.grain:
+            lines.append(f"- Grain: {hit.brief.grain}")
+        lines.append(f"- Confidence: {hit.brief.confidence:.2f}")
+        lines.append(f"- Rank: {hit.rank:.4f}")
         lines.append("")
     return "\n".join(lines).strip()
 

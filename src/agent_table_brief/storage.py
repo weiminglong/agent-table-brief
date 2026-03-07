@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from agent_table_brief.models import (
     MaintenanceResult,
     RepoSummary,
     ScanResult,
+    SearchHit,
+    SearchResult,
     TableBrief,
 )
 from agent_table_brief.repository import (
@@ -185,6 +188,43 @@ class CatalogStore:
         finally:
             connection.close()
 
+    def search(
+        self,
+        query: str,
+        repo_path: Path | None = None,
+        limit: int = 10,
+    ) -> SearchResult:
+        repo_row = self._resolve_repo_row(repo_path)
+        scan_row = self._active_scan_row(repo_row["id"])
+        scan_id = int(scan_row["id"])
+        escaped_query = _escape_fts_query(query)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    briefs_fts.table_name,
+                    bm25(briefs_fts) AS rank,
+                    briefs.payload_json
+                FROM briefs_fts
+                JOIN briefs
+                    ON briefs.table_name = briefs_fts.table_name
+                    AND briefs.scan_id = ?
+                WHERE briefs_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (scan_id, escaped_query, limit),
+            ).fetchall()
+        hits = [
+            SearchHit(
+                table=str(row["table_name"]),
+                rank=-float(row["rank"]),
+                brief=TableBrief.model_validate_json(str(row["payload_json"])),
+            )
+            for row in rows
+        ]
+        return SearchResult(query=query, hits=hits)
+
     def list_repos(self) -> list[RepoSummary]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -306,6 +346,15 @@ class CatalogStore:
                 CREATE INDEX IF NOT EXISTS idx_briefs_scan_short_name
                 ON briefs(scan_id, short_name);
                 CREATE INDEX IF NOT EXISTS idx_evidence_scan_table ON evidence(scan_id, table_name);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS briefs_fts USING fts5(
+                    table_name,
+                    purpose,
+                    grain,
+                    filters,
+                    alternatives,
+                    tokenize='unicode61'
+                );
                 """
             )
 
@@ -426,6 +475,20 @@ class CatalogStore:
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             evidence_rows,
+        )
+        fts_rows: list[tuple[str, str | None, str | None, str, str]] = []
+        for brief in briefs:
+            fts_rows.append((
+                brief.table,
+                brief.purpose,
+                brief.grain,
+                ", ".join(brief.filters_or_exclusions),
+                ", ".join(brief.alternatives),
+            ))
+        connection.executemany(
+            "INSERT INTO briefs_fts (table_name, purpose, grain, filters, alternatives)"
+            " VALUES (?, ?, ?, ?, ?)",
+            fts_rows,
         )
 
     def _set_active_repo_scan(
@@ -643,6 +706,16 @@ def _parse_timestamp(value: str) -> datetime:
 
 def _isoformat_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _escape_fts_query(query: str) -> str:
+    tokens = query.split()
+    escaped: list[str] = []
+    for token in tokens:
+        cleaned = re.sub(r"[^\w]", "", token)
+        if cleaned:
+            escaped.append(f'"{cleaned}"')
+    return " OR ".join(escaped) if escaped else '""'
 
 
 def _run_git(path: Path, *args: str) -> str | None:

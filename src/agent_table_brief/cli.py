@@ -7,7 +7,14 @@ from typing import Annotated, Any
 
 import typer
 
-from agent_table_brief.models import Catalog, CliError, CompareResult, RepoSummary, TableBrief
+from agent_table_brief.models import (
+    Catalog,
+    CliError,
+    CompareResult,
+    RepoSummary,
+    SearchResult,
+    TableBrief,
+)
 from agent_table_brief.render import (
     render_brief_json,
     render_brief_markdown,
@@ -15,6 +22,8 @@ from agent_table_brief.render import (
     render_catalog_markdown,
     render_compare_json,
     render_compare_markdown,
+    render_search_json,
+    render_search_markdown,
 )
 from agent_table_brief.repository import build_compare_result, scan_repository
 from agent_table_brief.storage import (
@@ -116,6 +125,25 @@ def compare(
 
 
 @app.command()
+def search(
+    query: TableArgument,
+    repo: RepoOption = None,
+    store: StoreOption = None,
+    format: FormatOption = OutputFormat.json,
+    limit: Annotated[int, typer.Option("--limit")] = 10,
+) -> None:
+    try:
+        result = _store(store).search(query, repo_path=repo, limit=limit)
+    except RepoNotScannedError as exc:
+        _fail("repo_not_scanned", str(exc), {"repo": _repo_detail(repo)})
+    except RepoAmbiguousError as exc:
+        _fail("repo_ambiguous", str(exc), {"repo": _repo_detail(repo)})
+    except Exception as exc:
+        _fail("search_failed", str(exc), {"query": query, "repo": _repo_detail(repo)})
+    typer.echo(_render_search(result, format))
+
+
+@app.command()
 def export(
     repo: RepoOption = None,
     store: StoreOption = None,
@@ -184,6 +212,12 @@ def _render_compare(result: CompareResult, format: OutputFormat) -> str:
     if format is OutputFormat.markdown:
         return render_compare_markdown(result)
     return render_compare_json(result)
+
+
+def _render_search(result: SearchResult, format: OutputFormat) -> str:
+    if format is OutputFormat.markdown:
+        return render_search_markdown(result)
+    return render_search_json(result)
 
 
 def _render_catalog(catalog: Catalog, format: OutputFormat) -> str:
