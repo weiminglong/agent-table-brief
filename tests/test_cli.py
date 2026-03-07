@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -12,29 +14,57 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_scan_and_brief_json(tmp_path: Path) -> None:
-    catalog_path = tmp_path / "catalog.json"
+    store_path = tmp_path / "store.db"
     result = runner.invoke(
         app,
-        ["scan", str(FIXTURES / "dbt_project"), "--catalog", str(catalog_path)],
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
     )
     assert result.exit_code == 0
-    assert catalog_path.exists()
+    payload = json.loads(result.stdout)
+    assert payload["brief_count"] == 5
+    assert payload["reused"] is False
 
     brief_result = runner.invoke(
         app,
-        ["brief", "mart.daily_active_users", "--catalog", str(catalog_path), "--format", "json"],
+        [
+            "brief",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
     )
     assert brief_result.exit_code == 0
-    payload = json.loads(brief_result.stdout)
-    assert payload["table"] == "mart.daily_active_users"
+    brief_payload = json.loads(brief_result.stdout)
+    assert brief_payload["table"] == "mart.daily_active_users"
+
+
+def test_scan_reuses_identical_repo(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["reused"] is True
+    assert payload["brief_count"] == 4
 
 
 def test_export_markdown(tmp_path: Path) -> None:
-    catalog_path = tmp_path / "catalog.json"
+    store_path = tmp_path / "store.db"
     export_path = tmp_path / "briefs.md"
     runner.invoke(
         app,
-        ["scan", str(FIXTURES / "sql_repo"), "--catalog", str(catalog_path)],
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
         catch_exceptions=False,
     )
 
@@ -42,8 +72,10 @@ def test_export_markdown(tmp_path: Path) -> None:
         app,
         [
             "export",
-            "--catalog",
-            str(catalog_path),
+            "--repo",
+            str(FIXTURES / "sql_repo"),
+            "--store",
+            str(store_path),
             "--format",
             "markdown",
             "--output",
@@ -55,14 +87,135 @@ def test_export_markdown(tmp_path: Path) -> None:
 
 
 def test_brief_unknown_table_exits_non_zero(tmp_path: Path) -> None:
-    catalog_path = tmp_path / "catalog.json"
+    store_path = tmp_path / "store.db"
     runner.invoke(
         app,
-        ["scan", str(FIXTURES / "sql_repo"), "--catalog", str(catalog_path)],
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
         catch_exceptions=False,
     )
     result = runner.invoke(
         app,
-        ["brief", "missing_table", "--catalog", str(catalog_path)],
+        [
+            "brief",
+            "missing_table",
+            "--repo",
+            str(FIXTURES / "sql_repo"),
+            "--store",
+            str(store_path),
+        ],
     )
     assert result.exit_code == 1
+    error = json.loads(result.stderr)
+    assert error["code"] == "brief_not_found"
+
+
+def test_brief_unscanned_repo_returns_repo_not_scanned(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+
+    unknown_repo = tmp_path / "empty"
+    unknown_repo.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "brief",
+            "marts.orders_by_day",
+            "--repo",
+            str(unknown_repo),
+            "--store",
+            str(store_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    error = json.loads(result.stderr)
+    assert error["code"] == "repo_not_scanned"
+
+
+def test_repos_lists_active_scans(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "sql_repo"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+
+    result = runner.invoke(app, ["repos", "--store", str(store_path)])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload) == 2
+    assert {item["project_type"] for item in payload} == {"dbt", "sql"}
+
+
+def test_scan_reuses_when_unrelated_yaml_changes(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    repo_path = tmp_path / "sql_repo"
+    shutil.copytree(FIXTURES / "sql_repo", repo_path)
+    extra_yaml = repo_path / "notes.yml"
+    extra_yaml.write_text("owner: analytics\n", encoding="utf-8")
+
+    first = runner.invoke(
+        app,
+        ["scan", str(repo_path), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    assert first.exit_code == 0
+
+    extra_yaml.write_text("owner: platform\n", encoding="utf-8")
+    second = runner.invoke(
+        app,
+        ["scan", str(repo_path), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+
+    payload = json.loads(second.stdout)
+    assert payload["reused"] is True
+
+
+def test_scan_reuses_across_git_clones(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    source_repo = tmp_path / "source_repo"
+    clone_a = tmp_path / "clone_a"
+    clone_b = tmp_path / "clone_b"
+    shutil.copytree(FIXTURES / "sql_repo", source_repo)
+
+    _git(source_repo, "init")
+    _git(source_repo, "config", "user.email", "test@example.com")
+    _git(source_repo, "config", "user.name", "Test User")
+    _git(source_repo, "add", ".")
+    _git(source_repo, "commit", "-m", "initial")
+    _git(tmp_path, "clone", str(source_repo), str(clone_a))
+    _git(tmp_path, "clone", str(source_repo), str(clone_b))
+
+    first = runner.invoke(
+        app,
+        ["scan", str(clone_a), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    assert first.exit_code == 0
+
+    second = runner.invoke(
+        app,
+        ["scan", str(clone_b), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    payload = json.loads(second.stdout)
+    assert payload["reused"] is True
+
+    repos_result = runner.invoke(app, ["repos", "--store", str(store_path)])
+    repos_payload = json.loads(repos_result.stdout)
+    assert len(repos_payload) == 1
+    assert repos_payload[0]["effective_root"] == str(clone_b.resolve())
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)

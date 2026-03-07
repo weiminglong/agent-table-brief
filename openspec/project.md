@@ -18,7 +18,7 @@ evidence-backed table briefs for coding agents and humans.
 ## Conventions
 
 - The public CLI is `tablebrief`.
-- The default catalog path is `.tablebrief/catalog.json`.
+- Runtime state is stored in a local SQLite database under `TABLEBRIEF_HOME` or the platform state directory.
 - Output should stay compact, deterministic, and agent-friendly.
 - Evidence must always point back to concrete files and line ranges.
 - Heuristics should prefer empty fields over speculative text.

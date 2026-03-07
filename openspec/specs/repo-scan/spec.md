@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define how `tablebrief scan` discovers analytics models and builds the local catalog.
+Define how `tablebrief scan` discovers analytics models and builds the local catalog store.
 
 ## Requirements
 
@@ -18,15 +18,15 @@ The system SHALL detect whether the input path is a dbt project or a plain SQL r
 - THEN the scanner classifies the repository as `sql`
 
 ### Requirement: Local Catalog Generation
-The system SHALL write scan results to a local JSON catalog.
+The system SHALL write scan results to a local SQLite-backed catalog store.
 
-#### Scenario: default catalog path
+#### Scenario: default store path
 - WHEN the caller does not override the catalog location
-- THEN the catalog is written to `.tablebrief/catalog.json`
+- THEN the catalog is written to `TABLEBRIEF_HOME/store.db` or the platform state directory fallback
 
-#### Scenario: repeatable output
+#### Scenario: unchanged repository
 - WHEN the same repository is scanned multiple times without file changes
-- THEN the catalog ordering remains deterministic
+- THEN the scanner reuses the active stored scan instead of duplicating brief rows
 
 ### Requirement: Repo-Native Metadata
 The system SHALL derive context from repository files without requiring warehouse access.

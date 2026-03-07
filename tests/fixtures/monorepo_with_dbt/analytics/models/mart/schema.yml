@@ -1,0 +1,5 @@
+version: 2
+
+models:
+  - name: daily_active_users
+    description: Daily active users by product surface

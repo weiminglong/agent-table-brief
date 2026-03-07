@@ -7,7 +7,7 @@ Define how `tablebrief export` emits the saved catalog for agents and humans.
 ## Requirements
 
 ### Requirement: Export Stored Catalog
-The system SHALL export the existing local catalog without rescanning the repository.
+The system SHALL export the existing stored catalog without rescanning the repository.
 
 #### Scenario: JSON export
 - WHEN the caller runs `tablebrief export --format json`
