@@ -194,6 +194,22 @@ def vacuum(store: StoreOption = None) -> None:
     typer.echo(result.model_dump_json(indent=2))
 
 
+@app.command()
+def serve(store: StoreOption = None) -> None:
+    if store is not None:
+        import os
+
+        os.environ["TABLEBRIEF_STORE"] = str(store.resolve())
+    try:
+        from agent_table_brief.mcp_server import run_server
+    except ImportError:
+        _fail(
+            "missing_dependency",
+            'The "mcp" package is required. Install with: uv pip install "agent-table-brief[mcp]"',
+        )
+    run_server()
+
+
 def main() -> None:
     app()
 

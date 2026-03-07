@@ -37,6 +37,9 @@ Homepage = "https://github.com/weiminglong/agent-table-brief"
 Repository = "https://github.com/weiminglong/agent-table-brief"
 Issues = "https://github.com/weiminglong/agent-table-brief/issues"
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+
 [dependency-groups]
 dev = [
     "mypy>=1.18.0",

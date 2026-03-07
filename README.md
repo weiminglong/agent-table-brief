@@ -95,6 +95,63 @@ uv run tablebrief gc
 uv run tablebrief vacuum
 ```
 
+## MCP Server
+
+`tablebrief` includes an optional [Model Context Protocol](https://modelcontextprotocol.io)
+server so AI editors and agents can query table briefs directly.
+
+Install the MCP extra:
+
+```bash
+uv pip install "agent-table-brief[mcp]"
+```
+
+Start the server:
+
+```bash
+uv run tablebrief serve
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "tablebrief": {
+      "command": "uv",
+      "args": ["run", "tablebrief", "serve"]
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "tablebrief": {
+      "command": "uv",
+      "args": ["run", "tablebrief", "serve"]
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_tables` | Search tables by keyword across purpose, grain, filters, and names |
+| `get_brief` | Get the full brief for a specific table |
+| `compare_tables` | Compare two or more tables side-by-side |
+| `list_tables` | List all tables in a scanned repository |
+| `list_repos` | List all scanned repositories |
+
 ## Storage
 
 By default, `tablebrief` stores scans in a local SQLite database at:
