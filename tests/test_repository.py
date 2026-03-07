@@ -7,6 +7,7 @@ import pytest
 from agent_table_brief.repository import (
     _clean_sql_for_parsing,
     _extract_sql_insights,
+    build_compare_result,
     detect_project_type,
     find_brief,
     scan_repository,
@@ -92,3 +93,49 @@ def test_find_brief_raises_for_ambiguous_short_name() -> None:
     catalog = scan_repository(FIXTURES / "dbt_project")
     with pytest.raises(KeyError):
         find_brief(catalog, "does_not_exist")
+
+
+def test_field_confidence_present_for_dbt_brief() -> None:
+    catalog = scan_repository(FIXTURES / "dbt_project")
+    brief = find_brief(catalog, "mart.daily_active_users")
+
+    assert "purpose" in brief.field_confidence
+    assert "grain" in brief.field_confidence
+    assert "primary_keys" in brief.field_confidence
+    assert "derived_from" in brief.field_confidence
+    assert "filters_or_exclusions" in brief.field_confidence
+    assert "freshness_hints" in brief.field_confidence
+    assert "downstream_usage" in brief.field_confidence
+    assert "alternatives" in brief.field_confidence
+    assert brief.field_confidence["purpose"] > 0.0
+    assert brief.field_confidence["grain"] > 0.0
+
+
+def test_grain_evidence_has_narrow_line_range() -> None:
+    catalog = scan_repository(FIXTURES / "dbt_project")
+    brief = find_brief(catalog, "mart.daily_active_users")
+
+    grain_evidence = brief.field_evidence.get("grain", brief.evidence)
+    for ref in grain_evidence:
+        assert ref.end_line - ref.start_line < 10, (
+            f"Expected narrow grain evidence range, got {ref.start_line}-{ref.end_line}"
+        )
+
+
+def test_alternatives_include_filter_divergent_pair() -> None:
+    catalog = scan_repository(FIXTURES / "dbt_project")
+    brief = find_brief(catalog, "mart.daily_active_users")
+    assert "mart.daily_active_users_all" in brief.alternatives
+
+
+def test_build_compare_result_detects_differences() -> None:
+    catalog = scan_repository(FIXTURES / "dbt_project")
+    brief_a = find_brief(catalog, "mart.daily_active_users")
+    brief_b = find_brief(catalog, "mart.daily_active_users_all")
+
+    result = build_compare_result([brief_a, brief_b])
+
+    assert len(result.tables) == 2
+    assert result.tables[0].table == "mart.daily_active_users"
+    assert result.tables[1].table == "mart.daily_active_users_all"
+    assert "filters_or_exclusions" in result.differences

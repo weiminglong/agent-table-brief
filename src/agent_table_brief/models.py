@@ -24,6 +24,7 @@ class TableBrief(BaseModel):
     downstream_usage: list[str] = Field(default_factory=list)
     alternatives: list[str] = Field(default_factory=list)
     confidence: float
+    field_confidence: dict[str, float] = Field(default_factory=dict)
     evidence: list[EvidenceRef] = Field(default_factory=list)
     field_evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict, exclude=True)
 
@@ -34,6 +35,16 @@ class Catalog(BaseModel):
     generated_at: datetime
     version: str
     briefs: list[TableBrief]
+
+
+class CompareEntry(BaseModel):
+    table: str
+    brief: TableBrief
+
+
+class CompareResult(BaseModel):
+    tables: list[CompareEntry]
+    differences: dict[str, list[str | None]]
 
 
 class ScanResult(BaseModel):
