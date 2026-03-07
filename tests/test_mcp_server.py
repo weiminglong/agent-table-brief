@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from agent_table_brief.cli import app
 
 runner = CliRunner()
 FIXTURES = Path(__file__).parent / "fixtures"
+
+_has_mcp = pytest.importorskip is not None  # just for the flag below
+try:
+    import mcp  # noqa: F401
+
+    _has_mcp = True
+except ModuleNotFoundError:
+    _has_mcp = False
+
+requires_mcp = pytest.mark.skipif(not _has_mcp, reason="mcp extra not installed")
 
 
 def _scan(store_path: Path, fixture: str = "dbt_project") -> None:
@@ -19,9 +31,8 @@ def _scan(store_path: Path, fixture: str = "dbt_project") -> None:
     )
 
 
+@requires_mcp
 def test_search_tables_tool(tmp_path: Path) -> None:
-    import os
-
     store_path = tmp_path / "store.db"
     _scan(store_path)
     os.environ["TABLEBRIEF_STORE"] = str(store_path)
@@ -36,9 +47,8 @@ def test_search_tables_tool(tmp_path: Path) -> None:
         del os.environ["TABLEBRIEF_STORE"]
 
 
+@requires_mcp
 def test_get_brief_tool(tmp_path: Path) -> None:
-    import os
-
     store_path = tmp_path / "store.db"
     _scan(store_path)
     os.environ["TABLEBRIEF_STORE"] = str(store_path)
@@ -53,9 +63,8 @@ def test_get_brief_tool(tmp_path: Path) -> None:
         del os.environ["TABLEBRIEF_STORE"]
 
 
+@requires_mcp
 def test_compare_tables_tool(tmp_path: Path) -> None:
-    import os
-
     store_path = tmp_path / "store.db"
     _scan(store_path)
     os.environ["TABLEBRIEF_STORE"] = str(store_path)
@@ -73,9 +82,8 @@ def test_compare_tables_tool(tmp_path: Path) -> None:
         del os.environ["TABLEBRIEF_STORE"]
 
 
+@requires_mcp
 def test_list_tables_tool(tmp_path: Path) -> None:
-    import os
-
     store_path = tmp_path / "store.db"
     _scan(store_path)
     os.environ["TABLEBRIEF_STORE"] = str(store_path)
@@ -90,9 +98,8 @@ def test_list_tables_tool(tmp_path: Path) -> None:
         del os.environ["TABLEBRIEF_STORE"]
 
 
+@requires_mcp
 def test_list_repos_tool(tmp_path: Path) -> None:
-    import os
-
     store_path = tmp_path / "store.db"
     _scan(store_path)
     os.environ["TABLEBRIEF_STORE"] = str(store_path)
