@@ -7,14 +7,16 @@ from typing import Annotated, Any
 
 import typer
 
-from agent_table_brief.models import Catalog, CliError, RepoSummary, TableBrief
+from agent_table_brief.models import Catalog, CliError, CompareResult, RepoSummary, TableBrief
 from agent_table_brief.render import (
     render_brief_json,
     render_brief_markdown,
     render_catalog_json,
     render_catalog_markdown,
+    render_compare_json,
+    render_compare_markdown,
 )
-from agent_table_brief.repository import scan_repository
+from agent_table_brief.repository import build_compare_result, scan_repository
 from agent_table_brief.storage import (
     CatalogStore,
     RepoAmbiguousError,
@@ -88,6 +90,32 @@ def brief(
 
 
 @app.command()
+def compare(
+    tables: Annotated[list[str], typer.Argument(min=2)],
+    repo: RepoOption = None,
+    store: StoreOption = None,
+    format: FormatOption = OutputFormat.json,
+) -> None:
+    catalog_store = _store(store)
+    briefs: list[TableBrief] = []
+    for table_name in tables:
+        try:
+            briefs.append(catalog_store.load_brief(table_name, repo_path=repo))
+        except RepoNotScannedError as exc:
+            _fail("repo_not_scanned", str(exc), {"repo": _repo_detail(repo)})
+        except RepoAmbiguousError as exc:
+            _fail("repo_ambiguous", str(exc), {"repo": _repo_detail(repo)})
+        except KeyError as exc:
+            _fail("brief_not_found", str(exc), {"table": table_name, "repo": _repo_detail(repo)})
+        except ValueError as exc:
+            _fail("brief_ambiguous", str(exc), {"table": table_name, "repo": _repo_detail(repo)})
+        except Exception as exc:
+            _fail("compare_failed", str(exc), {"table": table_name, "repo": _repo_detail(repo)})
+    result = build_compare_result(briefs)
+    typer.echo(_render_compare(result, format))
+
+
+@app.command()
 def export(
     repo: RepoOption = None,
     store: StoreOption = None,
@@ -150,6 +178,12 @@ def _render_brief(brief: TableBrief, format: OutputFormat) -> str:
     if format is OutputFormat.markdown:
         return render_brief_markdown(brief)
     return render_brief_json(brief)
+
+
+def _render_compare(result: CompareResult, format: OutputFormat) -> str:
+    if format is OutputFormat.markdown:
+        return render_compare_markdown(result)
+    return render_compare_json(result)
 
 
 def _render_catalog(catalog: Catalog, format: OutputFormat) -> str:

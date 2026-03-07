@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from agent_table_brief.models import Catalog, EvidenceRef, TableBrief
+from agent_table_brief.models import Catalog, CompareResult, EvidenceRef, TableBrief
 
 
 def render_brief_json(brief: TableBrief) -> str:
@@ -24,6 +24,11 @@ def render_brief_markdown(brief: TableBrief) -> str:
     lines.extend(_render_field("Downstream Usage", ", ".join(brief.downstream_usage)))
     lines.extend(_render_field("Alternatives", ", ".join(brief.alternatives)))
     lines.extend(_render_field("Confidence", f"{brief.confidence:.2f}"))
+    if brief.field_confidence:
+        lines.append("## Field Confidence")
+        for field_name, score in sorted(brief.field_confidence.items()):
+            lines.append(f"- {field_name}: {score:.2f}")
+        lines.append("")
     lines.append("## Evidence")
     if brief.evidence:
         lines.extend(f"- {_format_evidence(ref)}" for ref in brief.evidence)
@@ -45,6 +50,34 @@ def render_catalog_markdown(catalog: Catalog) -> str:
         body.append(render_brief_markdown(brief))
         body.append("")
     return "\n".join(body).strip()
+
+
+def render_compare_json(result: CompareResult) -> str:
+    return result.model_dump_json(indent=2)
+
+
+def render_compare_markdown(result: CompareResult) -> str:
+    lines = ["# Table Comparison", ""]
+    table_names = [entry.table for entry in result.tables]
+    lines.append(f"Comparing: {', '.join(table_names)}")
+    lines.append("")
+    if result.differences:
+        lines.append("## Differences")
+        lines.append("")
+        for field_name, values in result.differences.items():
+            lines.append(f"### {field_name}")
+            for i, value in enumerate(values):
+                lines.append(f"- **{table_names[i]}**: {value or 'unknown'}")
+            lines.append("")
+    else:
+        lines.append("No differences found.")
+        lines.append("")
+    lines.append("## Full Briefs")
+    lines.append("")
+    for entry in result.tables:
+        lines.append(render_brief_markdown(entry.brief))
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _render_field(label: str, value: str | None) -> list[str]:

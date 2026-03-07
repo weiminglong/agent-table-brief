@@ -217,5 +217,108 @@ def test_scan_reuses_across_git_clones(tmp_path: Path) -> None:
     assert repos_payload[0]["effective_root"] == str(clone_b.resolve())
 
 
+def test_compare_json_output(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "compare",
+            "mart.daily_active_users",
+            "mart.daily_active_users_all",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["tables"]) == 2
+    assert "differences" in payload
+    assert "filters_or_exclusions" in payload["differences"]
+
+
+def test_compare_unknown_table_exits_non_zero(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "compare",
+            "mart.daily_active_users",
+            "nonexistent_table",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+        ],
+    )
+    assert result.exit_code == 1
+    error = json.loads(result.stderr)
+    assert error["code"] == "brief_not_found"
+
+
+def test_brief_json_includes_field_confidence(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "brief",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "field_confidence" in payload
+    assert "purpose" in payload["field_confidence"]
+    assert payload["field_confidence"]["purpose"] > 0.0
+
+
+def test_export_markdown_includes_field_confidence(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "brief",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "markdown",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Field Confidence" in result.stdout
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)

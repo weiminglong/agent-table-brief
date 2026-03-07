@@ -14,7 +14,7 @@ from sqlglot import exp, parse_one
 from sqlglot.errors import ErrorLevel, ParseError
 
 from agent_table_brief import __version__
-from agent_table_brief.models import Catalog, EvidenceRef, TableBrief
+from agent_table_brief.models import Catalog, CompareEntry, CompareResult, EvidenceRef, TableBrief
 
 IGNORED_DIRS = {
     ".git",
@@ -96,9 +96,9 @@ class DiscoveredModel:
     raw_dependencies: list[str]
     filters: list[str]
     freshness_hints: list[str]
+    yaml_relative_path: str | None
+    yaml_path: Path | None
     purpose_evidence: list[EvidenceRef]
-    grain_evidence: list[EvidenceRef]
-    key_evidence: list[EvidenceRef]
     dependency_evidence: list[EvidenceRef]
     filter_evidence: list[EvidenceRef]
     freshness_evidence: list[EvidenceRef]
@@ -135,7 +135,10 @@ def scan_repository(root: Path, project_type: str = "auto") -> Catalog:
         for model in models
     }
     downstream = _build_downstream_map(normalized_deps)
-    briefs = [_build_brief(model, models, normalized_deps, downstream) for model in models]
+    grain_lookup = {model.table: _infer_grain(model)[0] for model in models}
+    briefs = [
+        _build_brief(model, models, normalized_deps, downstream, grain_lookup) for model in models
+    ]
     briefs.sort(key=lambda brief: brief.table)
     return Catalog(
         repo_root=str(scan_target.root),
@@ -166,6 +169,32 @@ def find_brief(catalog: Catalog, table_name: str) -> TableBrief:
         options = ", ".join(sorted(brief.table for brief in short_matches))
         raise ValueError(f"Table name is ambiguous: {table_name}. Matches: {options}")
     raise KeyError(f"Table not found in catalog: {table_name}")
+
+
+def build_compare_result(briefs: list[TableBrief]) -> CompareResult:
+    entries = [CompareEntry(table=brief.table, brief=brief) for brief in briefs]
+    compare_fields = [
+        "purpose",
+        "grain",
+        "primary_keys",
+        "derived_from",
+        "filters_or_exclusions",
+        "freshness_hints",
+        "downstream_usage",
+        "alternatives",
+    ]
+    differences: dict[str, list[str | None]] = {}
+    for field_name in compare_fields:
+        values: list[str | None] = []
+        for brief in briefs:
+            raw = getattr(brief, field_name)
+            if isinstance(raw, list):
+                values.append(", ".join(raw) if raw else None)
+            else:
+                values.append(raw)
+        if len(set(values)) > 1:
+            differences[field_name] = values
+    return CompareResult(tables=entries, differences=differences)
 
 
 def _discover_model(
@@ -216,8 +245,6 @@ def _discover_model(
         sql_text,
         materialized,
     )
-    grain_evidence = [_make_file_evidence(relative_path, sql_text, "sql")]
-    key_evidence = [_make_file_evidence(relative_path, sql_text, "sql")]
     dependency_evidence = _dependency_evidence(relative_path, sql_text, raw_dependencies)
     return DiscoveredModel(
         table=table_name,
@@ -235,9 +262,9 @@ def _discover_model(
         raw_dependencies=raw_dependencies,
         filters=filters,
         freshness_hints=freshness_hints,
+        yaml_relative_path=yaml_meta.relative_path if yaml_meta.composite_keys else None,
+        yaml_path=yaml_meta.path if yaml_meta.composite_keys else None,
         purpose_evidence=purpose_evidence,
-        grain_evidence=grain_evidence,
-        key_evidence=key_evidence,
         dependency_evidence=dependency_evidence,
         filter_evidence=filter_evidence,
         freshness_evidence=freshness_evidence,
@@ -255,28 +282,39 @@ def _build_brief(
     all_models: list[DiscoveredModel],
     normalized_deps: dict[str, list[str]],
     downstream: dict[str, list[str]],
+    grain_lookup: dict[str, str | None],
 ) -> TableBrief:
     purpose, purpose_score = _infer_purpose(model)
-    grain, grain_score = _infer_grain(model)
-    primary_keys, key_score = _infer_primary_keys(model)
+    grain, grain_score, grain_evidence = _infer_grain(model)
+    primary_keys, key_score, key_evidence = _infer_primary_keys(model)
     derived_from = normalized_deps[model.table]
     dependency_score = 0.95 if derived_from else 0.0
     downstream_usage = downstream.get(model.table, [])
     downstream_score = 0.9 if downstream_usage else 0.0
-    alternatives = _infer_alternatives(model, all_models, normalized_deps)
+    alternatives = _infer_alternatives(model, all_models, normalized_deps, grain_lookup)
     alternatives_score = 0.8 if alternatives else 0.0
     filters_score = 0.9 if model.filters else 0.0
     freshness_score = 0.9 if model.freshness_hints else 0.0
 
     field_evidence: dict[str, list[EvidenceRef]] = {
         "purpose": model.purpose_evidence if purpose else [],
-        "grain": model.grain_evidence if grain else [],
-        "primary_keys": model.key_evidence if primary_keys else [],
+        "grain": grain_evidence if grain else [],
+        "primary_keys": key_evidence if primary_keys else [],
         "derived_from": model.dependency_evidence if derived_from else [],
         "filters_or_exclusions": model.filter_evidence if model.filters else [],
         "freshness_hints": model.freshness_evidence if model.freshness_hints else [],
         "downstream_usage": [model.filename_evidence] if downstream_usage else [],
         "alternatives": [model.filename_evidence] if alternatives else [],
+    }
+    field_confidence = {
+        "purpose": purpose_score,
+        "grain": grain_score,
+        "primary_keys": key_score,
+        "derived_from": dependency_score,
+        "filters_or_exclusions": filters_score,
+        "freshness_hints": freshness_score,
+        "downstream_usage": downstream_score,
+        "alternatives": alternatives_score,
     }
     confidence = _compute_confidence(
         purpose_score,
@@ -302,6 +340,7 @@ def _build_brief(
         downstream_usage=downstream_usage,
         alternatives=alternatives,
         confidence=confidence,
+        field_confidence=field_confidence,
         evidence=evidence,
         field_evidence=field_evidence,
     )
@@ -315,44 +354,78 @@ def _infer_purpose(model: DiscoveredModel) -> tuple[str | None, float]:
     return _humanize_name(model.short_name), 0.45
 
 
-def _infer_grain(model: DiscoveredModel) -> tuple[str | None, float]:
+def _infer_grain(model: DiscoveredModel) -> tuple[str | None, float, list[EvidenceRef]]:
     if model.composite_keys:
-        return " x ".join(model.composite_keys[0]), 0.95
+        grain_text = " x ".join(model.composite_keys[0])
+        evidence = [
+            _make_fragment_evidence(
+                model.yaml_relative_path or model.relative_path,
+                model.yaml_path,
+                model.composite_keys[0][0],
+                "yaml",
+            )
+        ]
+        return grain_text, 0.95, evidence
     if model.group_by:
-        return " x ".join(model.group_by), 0.85
+        grain_text = " x ".join(model.group_by)
+        fragment = model.group_by[0]
+        evidence = [
+            _make_fragment_evidence(model.relative_path, None, fragment, "sql", model.sql_text)
+        ]
+        return grain_text, 0.85, evidence
     key_like_columns = [
         column
         for column in sorted(model.unique_columns)
         if column.endswith(("_id", "_key"))
     ]
     if key_like_columns:
-        return " x ".join(key_like_columns), 0.6
-    return None, 0.0
+        grain_text = " x ".join(key_like_columns)
+        evidence = [_make_file_evidence(model.relative_path, model.sql_text, "yaml")]
+        return grain_text, 0.6, evidence
+    return None, 0.0, []
 
 
-def _infer_primary_keys(model: DiscoveredModel) -> tuple[list[str], float]:
+def _infer_primary_keys(
+    model: DiscoveredModel,
+) -> tuple[list[str], float, list[EvidenceRef]]:
     if model.composite_keys:
-        return sorted(model.composite_keys[0]), 0.95
+        evidence = [
+            _make_fragment_evidence(
+                model.yaml_relative_path or model.relative_path,
+                model.yaml_path,
+                model.composite_keys[0][0],
+                "yaml",
+            )
+        ]
+        return sorted(model.composite_keys[0]), 0.95, evidence
     unique_and_required = sorted(model.unique_columns.intersection(model.not_null_columns))
     if unique_and_required:
-        return unique_and_required, 0.9
+        evidence = [_make_file_evidence(model.relative_path, model.sql_text, "yaml")]
+        return unique_and_required, 0.9, evidence
     group_by_keys = [
         column
         for column in model.group_by
         if column.endswith(("_id", "_key", "_date"))
     ]
     if group_by_keys:
-        return group_by_keys, 0.65
-    return [], 0.0
+        fragment = group_by_keys[0]
+        evidence = [
+            _make_fragment_evidence(model.relative_path, None, fragment, "sql", model.sql_text)
+        ]
+        return group_by_keys, 0.65, evidence
+    return [], 0.0, []
 
 
 def _infer_alternatives(
     model: DiscoveredModel,
     all_models: list[DiscoveredModel],
     normalized_deps: dict[str, list[str]],
+    grain_lookup: dict[str, str | None],
 ) -> list[str]:
     scored: list[tuple[float, str]] = []
     this_deps = set(normalized_deps[model.table])
+    this_grain = grain_lookup.get(model.table)
+    this_filters = set(model.filters)
     for other in all_models:
         if other.table == model.table:
             continue
@@ -360,8 +433,17 @@ def _infer_alternatives(
         other_deps = set(normalized_deps[other.table])
         dep_score = _jaccard_similarity(this_deps, other_deps)
         prefix_bonus = 0.1 if _shared_name_prefix(model.short_name, other.short_name) else 0.0
-        score = (0.6 * name_score) + (0.3 * dep_score) + prefix_bonus
-        if score >= 0.45:
+        other_grain = grain_lookup.get(other.table)
+        grain_bonus = 0.1 if this_grain and other_grain and this_grain == other_grain else 0.0
+        other_filters = set(other.filters)
+        filter_bonus = (
+            0.15
+            if _shared_name_prefix(model.short_name, other.short_name)
+            and this_filters != other_filters
+            else 0.0
+        )
+        score = (0.6 * name_score) + (0.3 * dep_score) + prefix_bonus + grain_bonus + filter_bonus
+        if score >= 0.40:
             scored.append((score, other.table))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [table for _, table in scored[:3]]
