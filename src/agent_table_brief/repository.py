@@ -96,9 +96,9 @@ class DiscoveredModel:
     raw_dependencies: list[str]
     filters: list[str]
     freshness_hints: list[str]
+    yaml_relative_path: str | None
+    yaml_path: Path | None
     purpose_evidence: list[EvidenceRef]
-    grain_evidence: list[EvidenceRef]
-    key_evidence: list[EvidenceRef]
     dependency_evidence: list[EvidenceRef]
     filter_evidence: list[EvidenceRef]
     freshness_evidence: list[EvidenceRef]
@@ -135,7 +135,10 @@ def scan_repository(root: Path, project_type: str = "auto") -> Catalog:
         for model in models
     }
     downstream = _build_downstream_map(normalized_deps)
-    briefs = [_build_brief(model, models, normalized_deps, downstream) for model in models]
+    grain_lookup = {model.table: _infer_grain(model)[0] for model in models}
+    briefs = [
+        _build_brief(model, models, normalized_deps, downstream, grain_lookup) for model in models
+    ]
     briefs.sort(key=lambda brief: brief.table)
     return Catalog(
         repo_root=str(scan_target.root),
@@ -242,8 +245,6 @@ def _discover_model(
         sql_text,
         materialized,
     )
-    grain_evidence = [_make_file_evidence(relative_path, sql_text, "sql")]
-    key_evidence = [_make_file_evidence(relative_path, sql_text, "sql")]
     dependency_evidence = _dependency_evidence(relative_path, sql_text, raw_dependencies)
     return DiscoveredModel(
         table=table_name,
@@ -261,9 +262,9 @@ def _discover_model(
         raw_dependencies=raw_dependencies,
         filters=filters,
         freshness_hints=freshness_hints,
+        yaml_relative_path=yaml_meta.relative_path if yaml_meta.composite_keys else None,
+        yaml_path=yaml_meta.path if yaml_meta.composite_keys else None,
         purpose_evidence=purpose_evidence,
-        grain_evidence=grain_evidence,
-        key_evidence=key_evidence,
         dependency_evidence=dependency_evidence,
         filter_evidence=filter_evidence,
         freshness_evidence=freshness_evidence,
@@ -281,6 +282,7 @@ def _build_brief(
     all_models: list[DiscoveredModel],
     normalized_deps: dict[str, list[str]],
     downstream: dict[str, list[str]],
+    grain_lookup: dict[str, str | None],
 ) -> TableBrief:
     purpose, purpose_score = _infer_purpose(model)
     grain, grain_score, grain_evidence = _infer_grain(model)
@@ -289,7 +291,7 @@ def _build_brief(
     dependency_score = 0.95 if derived_from else 0.0
     downstream_usage = downstream.get(model.table, [])
     downstream_score = 0.9 if downstream_usage else 0.0
-    alternatives = _infer_alternatives(model, all_models, normalized_deps)
+    alternatives = _infer_alternatives(model, all_models, normalized_deps, grain_lookup)
     alternatives_score = 0.8 if alternatives else 0.0
     filters_score = 0.9 if model.filters else 0.0
     freshness_score = 0.9 if model.freshness_hints else 0.0
@@ -355,10 +357,12 @@ def _infer_purpose(model: DiscoveredModel) -> tuple[str | None, float]:
 def _infer_grain(model: DiscoveredModel) -> tuple[str | None, float, list[EvidenceRef]]:
     if model.composite_keys:
         grain_text = " x ".join(model.composite_keys[0])
-        composite_fragment = ", ".join(model.composite_keys[0])
         evidence = [
             _make_fragment_evidence(
-                model.relative_path, None, composite_fragment, "yaml", model.sql_text
+                model.yaml_relative_path or model.relative_path,
+                model.yaml_path,
+                model.composite_keys[0][0],
+                "yaml",
             )
         ]
         return grain_text, 0.95, evidence
@@ -387,11 +391,10 @@ def _infer_primary_keys(
     if model.composite_keys:
         evidence = [
             _make_fragment_evidence(
-                model.relative_path,
-                None,
-                ", ".join(model.composite_keys[0]),
+                model.yaml_relative_path or model.relative_path,
+                model.yaml_path,
+                model.composite_keys[0][0],
                 "yaml",
-                model.sql_text,
             )
         ]
         return sorted(model.composite_keys[0]), 0.95, evidence
@@ -417,10 +420,11 @@ def _infer_alternatives(
     model: DiscoveredModel,
     all_models: list[DiscoveredModel],
     normalized_deps: dict[str, list[str]],
+    grain_lookup: dict[str, str | None],
 ) -> list[str]:
     scored: list[tuple[float, str]] = []
     this_deps = set(normalized_deps[model.table])
-    this_grain = _infer_grain(model)[0]
+    this_grain = grain_lookup.get(model.table)
     this_filters = set(model.filters)
     for other in all_models:
         if other.table == model.table:
@@ -429,7 +433,7 @@ def _infer_alternatives(
         other_deps = set(normalized_deps[other.table])
         dep_score = _jaccard_similarity(this_deps, other_deps)
         prefix_bonus = 0.1 if _shared_name_prefix(model.short_name, other.short_name) else 0.0
-        other_grain = _infer_grain(other)[0]
+        other_grain = grain_lookup.get(other.table)
         grain_bonus = 0.1 if this_grain and other_grain and this_grain == other_grain else 0.0
         other_filters = set(other.filters)
         filter_bonus = (
