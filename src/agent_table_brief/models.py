@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -33,3 +34,36 @@ class Catalog(BaseModel):
     generated_at: datetime
     version: str
     briefs: list[TableBrief]
+
+
+class ScanResult(BaseModel):
+    repo_key: str
+    repo_root: str
+    effective_root: str
+    project_type: str
+    scan_id: int
+    status: str
+    reused: bool
+    brief_count: int
+    generated_at: datetime
+
+
+class RepoSummary(BaseModel):
+    repo_key: str
+    repo_root: str
+    effective_root: str
+    project_type: str
+    brief_count: int
+    generated_at: datetime
+
+
+class MaintenanceResult(BaseModel):
+    repos_considered: int
+    scans_removed: int
+
+
+class CliError(BaseModel):
+    code: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

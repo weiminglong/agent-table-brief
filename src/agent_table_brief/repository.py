@@ -105,30 +105,29 @@ class DiscoveredModel:
     filename_evidence: EvidenceRef
 
 
+@dataclass(frozen=True)
+class ScanTarget:
+    root: Path
+    project_type: str
+
+
 def detect_project_type(root: Path) -> str:
-    if (root / "dbt_project.yml").exists():
-        return "dbt"
-    if list(_iter_files(root, suffixes={".sql"}, include_target=False)):
-        return "sql"
-    raise ValueError(f"No SQL files found under {root}")
+    return _resolve_scan_target(root, "auto").project_type
 
 
 def scan_repository(root: Path, project_type: str = "auto") -> Catalog:
-    resolved_root = root.resolve()
-    detected_project_type = (
-        detect_project_type(resolved_root) if project_type == "auto" else project_type
-    )
-    yaml_metadata = _load_yaml_metadata(resolved_root)
-    manifest_metadata = _load_manifest_metadata(resolved_root)
+    scan_target = _resolve_scan_target(root, project_type)
+    yaml_metadata = _load_yaml_metadata(scan_target.root)
+    manifest_metadata = _load_manifest_metadata(scan_target.root)
     models = [
         _discover_model(
             path,
-            resolved_root,
-            detected_project_type,
+            scan_target.root,
+            scan_target.project_type,
             yaml_metadata,
             manifest_metadata,
         )
-        for path in _iter_files(resolved_root, suffixes={".sql"})
+        for path in _discover_model_files(scan_target.root, scan_target.project_type)
     ]
     name_lookup = _build_name_lookup(models)
     normalized_deps = {
@@ -139,8 +138,8 @@ def scan_repository(root: Path, project_type: str = "auto") -> Catalog:
     briefs = [_build_brief(model, models, normalized_deps, downstream) for model in models]
     briefs.sort(key=lambda brief: brief.table)
     return Catalog(
-        repo_root=str(resolved_root),
-        project_type=detected_project_type,
+        repo_root=str(scan_target.root),
+        project_type=scan_target.project_type,
         generated_at=datetime.now(UTC),
         version=__version__,
         briefs=briefs,
@@ -428,9 +427,71 @@ def _build_downstream_map(normalized_deps: dict[str, list[str]]) -> dict[str, li
     return dict(downstream)
 
 
+def _resolve_scan_target(root: Path, project_type: str) -> ScanTarget:
+    resolved_root = root.resolve()
+    if project_type == "dbt":
+        return ScanTarget(root=_resolve_dbt_root(resolved_root), project_type="dbt")
+    if project_type == "sql":
+        if list(_iter_files(resolved_root, suffixes={".sql"}, include_target=False)):
+            return ScanTarget(root=resolved_root, project_type="sql")
+        raise ValueError(f"No SQL files found under {resolved_root}")
+    if project_type != "auto":
+        raise ValueError(f"Unsupported project type: {project_type}")
+    if (resolved_root / "dbt_project.yml").exists():
+        return ScanTarget(root=resolved_root, project_type="dbt")
+    nested_dbt_roots = _find_nested_dbt_roots(resolved_root)
+    if len(nested_dbt_roots) == 1:
+        return ScanTarget(root=nested_dbt_roots[0], project_type="dbt")
+    if len(nested_dbt_roots) > 1:
+        candidates = ", ".join(
+            path.relative_to(resolved_root).as_posix() for path in nested_dbt_roots
+        )
+        raise ValueError(
+            f"Multiple dbt projects found under {resolved_root}: {candidates}. "
+            "Scan one directly or pass --project-type sql."
+        )
+    if list(_iter_files(resolved_root, suffixes={".sql"}, include_target=False)):
+        return ScanTarget(root=resolved_root, project_type="sql")
+    raise ValueError(f"No SQL files found under {resolved_root}")
+
+
+def _resolve_dbt_root(root: Path) -> Path:
+    if (root / "dbt_project.yml").exists():
+        return root
+    nested_dbt_roots = _find_nested_dbt_roots(root)
+    if len(nested_dbt_roots) == 1:
+        return nested_dbt_roots[0]
+    if len(nested_dbt_roots) > 1:
+        candidates = ", ".join(path.relative_to(root).as_posix() for path in nested_dbt_roots)
+        raise ValueError(
+            f"Multiple dbt projects found under {root}: {candidates}. Scan one directly."
+        )
+    raise ValueError(f"No dbt_project.yml found under {root}")
+
+
+def _find_nested_dbt_roots(root: Path) -> list[Path]:
+    dbt_roots: list[Path] = []
+    for path in root.rglob("dbt_project.yml"):
+        if path.parent == root:
+            continue
+        if any(part in IGNORED_DIRS for part in path.parts):
+            continue
+        dbt_roots.append(path.parent)
+    return sorted(dbt_roots)
+
+
+def _discover_model_files(root: Path, project_type: str) -> list[Path]:
+    if project_type == "dbt":
+        models_root = root / "models"
+        if not models_root.exists():
+            return []
+        return _iter_files(models_root, suffixes={".sql"}, include_target=False)
+    return _iter_files(root, suffixes={".sql"})
+
+
 def _load_yaml_metadata(root: Path) -> dict[str, YamlMetadata]:
     metadata: dict[str, YamlMetadata] = {}
-    for path in _iter_files(root, suffixes={".yml", ".yaml"}):
+    for path in _discover_metadata_yaml_files(root):
         relative_path = path.relative_to(root).as_posix()
         for document in yaml.safe_load_all(path.read_text(encoding="utf-8")):
             if not isinstance(document, dict):
@@ -452,6 +513,21 @@ def _load_yaml_metadata(root: Path) -> dict[str, YamlMetadata]:
                         _yaml_entry_to_metadata(path, relative_path, entry),
                     )
     return metadata
+
+
+def _discover_metadata_yaml_files(root: Path) -> list[Path]:
+    relevant_paths: list[Path] = []
+    for path in _iter_files(root, suffixes={".yml", ".yaml"}):
+        has_metadata = False
+        for document in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            if not isinstance(document, dict):
+                continue
+            if any(isinstance(document.get(key), list) for key in ("models", "tables")):
+                has_metadata = True
+                break
+        if has_metadata:
+            relevant_paths.append(path)
+    return relevant_paths
 
 
 def _yaml_entry_to_metadata(path: Path, relative_path: str, entry: dict[str, Any]) -> YamlMetadata:
@@ -647,9 +723,26 @@ def _extract_sql_insights(cleaned_sql: str) -> SqlInsights:
     group_by: list[str] = []
     group = expression.args.get("group")
     if isinstance(group, exp.Group):
-        group_by = [_normalize_identifier(item.sql()) for item in group.expressions]
-    where_clauses = [where.this.sql() for where in expression.find_all(exp.Where)]
+        group_by = [
+            _normalize_identifier(item_sql)
+            for item in group.expressions
+            if (item_sql := _safe_expression_sql(item))
+        ]
+    where_clauses = [
+        clause_sql
+        for where in expression.find_all(exp.Where)
+        if (clause_sql := _safe_expression_sql(where.this))
+    ]
     return SqlInsights(table_refs=table_refs, group_by=group_by, where_clauses=where_clauses)
+
+
+def _safe_expression_sql(expression: exp.Expression | None) -> str | None:
+    if expression is None:
+        return None
+    try:
+        return expression.sql()
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _extract_top_comment(sql_text: str) -> str | None:

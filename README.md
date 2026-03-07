@@ -5,7 +5,8 @@ Turn analytics codebases into compact table briefs that coding agents can actual
 `agent-table-brief` is a local-first CLI toolkit that scans a dbt or SQL repository and extracts
 table-level context like purpose, grain, keys, exclusions, dependencies, and likely alternatives.
 Its primary CLI command, `tablebrief`, is designed for coding agents that need better table
-understanding before they generate SQL.
+understanding before they generate SQL. Runtime state lives in a local SQLite store, with JSON and
+Markdown exports available on demand.
 
 ## Why
 
@@ -59,25 +60,51 @@ uv run tablebrief --help
 
 ## Usage
 
-Scan a repository into a local catalog:
+Scan a repository into the local store:
 
 ```bash
 uv run tablebrief scan path/to/repo
 ```
 
+In auto mode, `tablebrief` will scan a nested dbt project if the provided directory contains
+exactly one `dbt_project.yml`. If multiple nested dbt projects are present, it raises an error and
+asks you to target one subdirectory directly.
+
 Generate a brief for one table:
 
 ```bash
-uv run tablebrief brief mart.daily_active_users --format json
+uv run tablebrief brief mart.daily_active_users --repo path/to/repo --format json
 ```
 
-Export the full catalog:
+Export the active stored catalog:
 
 ```bash
-uv run tablebrief export --format markdown --output briefs.md
+uv run tablebrief export --repo path/to/repo --format markdown --output briefs.md
 ```
 
-The default catalog location is `.tablebrief/catalog.json`.
+List scanned repositories:
+
+```bash
+uv run tablebrief repos
+```
+
+Maintenance commands:
+
+```bash
+uv run tablebrief gc
+uv run tablebrief vacuum
+```
+
+## Storage
+
+By default, `tablebrief` stores scans in a local SQLite database at:
+
+- `$TABLEBRIEF_HOME/store.db` when `TABLEBRIEF_HOME` is set
+- macOS: `~/Library/Application Support/tablebrief/store.db`
+- Linux: `$XDG_STATE_HOME/tablebrief/store.db` or `~/.local/state/tablebrief/store.db`
+- Windows: `%LOCALAPPDATA%\\tablebrief\\store.db`
+
+Override the database location per command with `--store <path>`.
 
 ## Example Brief
 
@@ -101,6 +128,22 @@ The default catalog location is `.tablebrief/catalog.json`.
       "kind": "sql"
     }
   ]
+}
+```
+
+## Example Scan Result
+
+```json
+{
+  "repo_key": "d3683f03e2bb42b259baecf27e52042d9faeb8abe60caa45e79ae9d974180f5a",
+  "repo_root": "/path/to/repo",
+  "effective_root": "/path/to/repo/dbt_clickhouse",
+  "project_type": "dbt",
+  "scan_id": 1,
+  "status": "complete",
+  "reused": false,
+  "brief_count": 914,
+  "generated_at": "2026-03-07T04:07:09.663114Z"
 }
 ```
 
@@ -161,7 +204,7 @@ It is a context extraction tool, not a warehouse agent.
 
 ## Roadmap
 
-- v0.1: repo scan, dbt model discovery, purpose/grain extraction, local catalog, brief/export
+- v0.1: repo scan, dbt model discovery, SQLite-backed local store, brief/export
 - v0.2: better alternatives, compare command, stronger evidence mapping, confidence scoring
 - v0.3: semantic search, editor integrations, MCP server, optional warehouse metadata fusion
 

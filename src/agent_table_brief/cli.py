@@ -1,20 +1,28 @@
+from __future__ import annotations
+
+import json
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
-from agent_table_brief.models import Catalog, TableBrief
+from agent_table_brief.models import Catalog, CliError, RepoSummary, TableBrief
 from agent_table_brief.render import (
     render_brief_json,
     render_brief_markdown,
     render_catalog_json,
     render_catalog_markdown,
 )
-from agent_table_brief.repository import find_brief, load_catalog, save_catalog, scan_repository
+from agent_table_brief.repository import scan_repository
+from agent_table_brief.storage import (
+    CatalogStore,
+    RepoAmbiguousError,
+    RepoNotScannedError,
+    resolve_store_path,
+)
 
 app = typer.Typer(help="Generate compact table briefs from dbt and SQL repositories.")
-DEFAULT_CATALOG = Path(".tablebrief/catalog.json")
 
 
 class ProjectType(StrEnum):
@@ -32,11 +40,11 @@ RepoArgument = Annotated[
     Path,
     typer.Argument(exists=True, file_okay=False, resolve_path=True),
 ]
-CatalogOption = Annotated[
-    Path,
-    typer.Option("--catalog", exists=True, dir_okay=False),
+RepoOption = Annotated[
+    Path | None,
+    typer.Option("--repo", exists=True, file_okay=False, resolve_path=True),
 ]
-CatalogWriteOption = Annotated[Path, typer.Option("--catalog")]
+StoreOption = Annotated[Path | None, typer.Option("--store", dir_okay=False, resolve_path=True)]
 OutputOption = Annotated[Path | None, typer.Option("--output")]
 FormatOption = Annotated[OutputFormat, typer.Option("--format")]
 ProjectTypeOption = Annotated[ProjectType, typer.Option("--project-type")]
@@ -47,49 +55,95 @@ TableArgument = Annotated[str, typer.Argument()]
 def scan(
     path: RepoArgument = Path("."),
     project_type: ProjectTypeOption = ProjectType.auto,
-    catalog: CatalogWriteOption = DEFAULT_CATALOG,
+    store: StoreOption = None,
 ) -> None:
-    scanned_catalog = scan_repository(path, project_type=project_type.value)
-    save_catalog(scanned_catalog, catalog)
-    typer.echo(
-        f"Scanned {len(scanned_catalog.briefs)} tables from {scanned_catalog.repo_root} "
-        f"({scanned_catalog.project_type}) into {catalog}"
-    )
+    try:
+        scanned_catalog = scan_repository(path, project_type=project_type.value)
+        result = _store(store).store_scan(scanned_catalog)
+    except Exception as exc:
+        _fail("scan_failed", str(exc), {"path": str(path)})
+    typer.echo(result.model_dump_json(indent=2))
 
 
 @app.command()
 def brief(
     table: TableArgument,
-    catalog: CatalogOption = DEFAULT_CATALOG,
+    repo: RepoOption = None,
+    store: StoreOption = None,
     format: FormatOption = OutputFormat.json,
 ) -> None:
-    loaded_catalog = load_catalog(catalog)
     try:
-        table_brief = find_brief(loaded_catalog, table)
-    except (KeyError, ValueError) as exc:
-        _echo_error(str(exc))
-        raise typer.Exit(code=1) from None
+        table_brief = _store(store).load_brief(table, repo_path=repo)
+    except RepoNotScannedError as exc:
+        _fail("repo_not_scanned", str(exc), {"repo": _repo_detail(repo)})
+    except RepoAmbiguousError as exc:
+        _fail("repo_ambiguous", str(exc), {"repo": _repo_detail(repo)})
+    except KeyError as exc:
+        _fail("brief_not_found", str(exc), {"table": table, "repo": _repo_detail(repo)})
+    except ValueError as exc:
+        _fail("brief_ambiguous", str(exc), {"table": table, "repo": _repo_detail(repo)})
+    except Exception as exc:
+        _fail("brief_failed", str(exc), {"table": table, "repo": _repo_detail(repo)})
     typer.echo(_render_brief(table_brief, format))
 
 
 @app.command()
 def export(
-    catalog: CatalogOption = DEFAULT_CATALOG,
+    repo: RepoOption = None,
+    store: StoreOption = None,
     format: FormatOption = OutputFormat.json,
     output: OutputOption = None,
 ) -> None:
-    loaded_catalog = load_catalog(catalog)
+    try:
+        loaded_catalog = _store(store).load_catalog(repo_path=repo)
+    except RepoNotScannedError as exc:
+        _fail("repo_not_scanned", str(exc), {"repo": _repo_detail(repo)})
+    except RepoAmbiguousError as exc:
+        _fail("repo_ambiguous", str(exc), {"repo": _repo_detail(repo)})
+    except Exception as exc:
+        _fail("export_failed", str(exc), {"repo": _repo_detail(repo)})
     rendered = _render_catalog(loaded_catalog, format)
     if output is None:
         typer.echo(rendered)
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(rendered + "\n", encoding="utf-8")
-    typer.echo(f"Wrote {format.value} catalog to {output}")
+    typer.echo(json.dumps({"output": str(output), "format": format.value}, indent=2))
+
+
+@app.command()
+def repos(store: StoreOption = None) -> None:
+    try:
+        summaries = _store(store).list_repos()
+    except Exception as exc:
+        _fail("repos_failed", str(exc))
+    typer.echo(_render_json_list(summaries))
+
+
+@app.command()
+def gc(store: StoreOption = None) -> None:
+    try:
+        result = _store(store).gc()
+    except Exception as exc:
+        _fail("gc_failed", str(exc))
+    typer.echo(result.model_dump_json(indent=2))
+
+
+@app.command()
+def vacuum(store: StoreOption = None) -> None:
+    try:
+        result = _store(store).vacuum()
+    except Exception as exc:
+        _fail("vacuum_failed", str(exc))
+    typer.echo(result.model_dump_json(indent=2))
 
 
 def main() -> None:
     app()
+
+
+def _store(store_path: Path | None) -> CatalogStore:
+    return CatalogStore(resolve_store_path(store_path))
 
 
 def _render_brief(brief: TableBrief, format: OutputFormat) -> str:
@@ -104,5 +158,15 @@ def _render_catalog(catalog: Catalog, format: OutputFormat) -> str:
     return render_catalog_json(catalog)
 
 
-def _echo_error(message: str) -> None:
-    typer.secho(message, err=True, fg=typer.colors.RED)
+def _render_json_list(items: list[RepoSummary]) -> str:
+    return json.dumps([item.model_dump(mode="json") for item in items], indent=2)
+
+
+def _repo_detail(repo: Path | None) -> str:
+    return str(repo.resolve()) if repo is not None else str(Path.cwd())
+
+
+def _fail(code: str, message: str, details: dict[str, Any] | None = None) -> None:
+    payload = CliError(code=code, message=message, details=details or {})
+    typer.echo(payload.model_dump_json(indent=2), err=True)
+    raise typer.Exit(code=1)
