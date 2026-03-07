@@ -24,6 +24,38 @@ That context often lives in code, comments, tests, YAML, naming patterns, and li
 schemas. `agent-table-brief` extracts that context into a local catalog that humans and coding
 agents can reuse.
 
+## Quickstart
+
+Get from zero to your first table brief in under a minute.
+
+**Prerequisites:** Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+```bash
+# 1. Clone and install
+git clone https://github.com/weiminglong/agent-table-brief.git
+cd agent-table-brief
+uv sync --all-groups
+
+# 2. Scan the included demo project
+uv run tablebrief scan tests/fixtures/dbt_project
+
+# 3. View a brief
+uv run tablebrief brief mart.daily_active_users \
+  --repo tests/fixtures/dbt_project --format json
+
+# 4. Compare two similar tables
+uv run tablebrief compare mart.daily_active_users mart.daily_active_users_all \
+  --repo tests/fixtures/dbt_project --format json
+
+# 5. Search the catalog
+uv run tablebrief search "active users" \
+  --repo tests/fixtures/dbt_project --format json
+
+# 6. Export everything as Markdown
+uv run tablebrief export \
+  --repo tests/fixtures/dbt_project --format markdown
+```
+
 ## Features
 
 `tablebrief` scans dbt projects, plain SQL repositories, and YAML metadata files. It uses
@@ -38,71 +70,140 @@ comments, naming conventions, lineage, tests, and filter heuristics to produce b
 
 Beyond scanning, `tablebrief` also provides:
 
-- **compare**: side-by-side structured diff of two or more tables
-- **search**: full-text search over the catalog using SQLite FTS5
-- **MCP server**: expose the catalog to AI editors and agents via the Model Context Protocol
+- **compare** -- side-by-side structured diff of two or more tables
+- **search** -- full-text search over the catalog using SQLite FTS5
+- **MCP server** -- expose the catalog to AI editors and agents via the Model Context Protocol
+
+## How It Works
+
+```
+your repo                tablebrief                  output
+─────────                ──────────                  ──────
+.sql files ──┐
+.yml files ──┤  scan ──► SQLite store ──► brief (JSON/Markdown)
+dbt config ──┤                       ──► compare
+manifest   ──┘                       ──► search (FTS5)
+                                     ──► export (full catalog)
+                                     ──► MCP server (for AI editors)
+```
+
+1. **Scan** discovers SQL models (`.sql` files) and YAML metadata (`.yml` / `.yaml`) in a dbt or
+   plain SQL project. It parses SQL with [sqlglot](https://github.com/tobymao/sqlglot), reads
+   dbt `ref()` / `source()` calls, extracts comments, inspects `schema.yml` tests, and reads
+   `target/manifest.json` when available.
+2. **Build briefs** for each discovered table: purpose (from descriptions, comments, or filename),
+   grain (from `GROUP BY`, composite key tests, or unique constraints), primary keys, upstream
+   dependencies, downstream consumers, freshness hints, filters/exclusions, and similar
+   alternative tables.
+3. **Store** the resulting catalog in a local SQLite database with content-hash deduplication so
+   re-scanning unchanged repos is instant.
+4. **Query** the catalog via CLI commands, JSON/Markdown output, or the MCP server.
+
+### Table naming
+
+Tables are named as `schema.model` where:
+
+- **dbt projects**: schema comes from the directory under `models/` (e.g.,
+  `models/mart/daily_active_users.sql` becomes `mart.daily_active_users`).
+  Aliases and schemas from `config()` or `manifest.json` take priority.
+- **plain SQL projects**: schema comes from the parent directory of the `.sql` file.
+
+### Confidence scores
+
+Every brief includes a `confidence` score (0.0 -- 0.99) and per-field `field_confidence` scores.
+These indicate how much evidence backed each inference:
+
+| Score range | Meaning |
+|-------------|---------|
+| 0.90 -- 0.99 | Strong evidence (explicit YAML description, composite key test) |
+| 0.60 -- 0.89 | Moderate evidence (top comment, GROUP BY columns, schema tests) |
+| 0.40 -- 0.59 | Weak evidence (filename heuristic only) |
+| 0.00 | No evidence found for this field |
 
 ## Install
 
 ```bash
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone and sync
+git clone https://github.com/weiminglong/agent-table-brief.git
+cd agent-table-brief
 uv sync --all-groups
-```
 
-Run the CLI through `uv` during development:
-
-```bash
+# Verify
 uv run tablebrief --help
 ```
 
-## Usage
+## CLI Reference
 
-Scan a repository into the local store:
+### `scan` -- ingest a repository
 
 ```bash
 uv run tablebrief scan path/to/repo
+uv run tablebrief scan path/to/repo --project-type dbt   # force dbt mode
+uv run tablebrief scan path/to/repo --project-type sql   # force plain SQL mode
 ```
 
-In auto mode, `tablebrief` will scan a nested dbt project if the provided directory contains
-exactly one `dbt_project.yml`. If multiple nested dbt projects are present, it raises an error and
-asks you to target one subdirectory directly.
+In `auto` mode (the default), `tablebrief` detects whether the repo is dbt or plain SQL. If the
+directory contains exactly one nested `dbt_project.yml`, it auto-selects that project. If
+multiple are found, it raises an error asking you to target one subdirectory.
 
-Generate a brief for one table:
+### `brief` -- get one table's brief
 
 ```bash
 uv run tablebrief brief mart.daily_active_users --repo path/to/repo --format json
+uv run tablebrief brief daily_active_users --repo path/to/repo   # short name works if unambiguous
 ```
 
-Export the active stored catalog:
-
-```bash
-uv run tablebrief export --repo path/to/repo --format markdown --output briefs.md
-```
-
-Compare two or more tables side-by-side:
+### `compare` -- diff two or more tables
 
 ```bash
 uv run tablebrief compare mart.daily_active_users mart.daily_active_users_all \
   --repo path/to/repo --format json
 ```
 
-Search for tables by keyword:
+Returns a structured diff showing only the fields that diverge between tables.
+
+### `search` -- full-text search
 
 ```bash
 uv run tablebrief search "daily active users" --repo path/to/repo --format json --limit 10
 ```
 
-List scanned repositories:
+Uses SQLite FTS5 to search across table names, purposes, grain, filters, and alternatives.
+
+### `export` -- dump the full catalog
+
+```bash
+uv run tablebrief export --repo path/to/repo --format markdown --output briefs.md
+uv run tablebrief export --repo path/to/repo --format json
+```
+
+### `repos` -- list scanned repositories
 
 ```bash
 uv run tablebrief repos
 ```
 
-Maintenance commands:
+### `gc` / `vacuum` -- maintenance
 
 ```bash
-uv run tablebrief gc
-uv run tablebrief vacuum
+uv run tablebrief gc       # remove old scans (keeps 3 per repo)
+uv run tablebrief vacuum   # reclaim SQLite disk space
 ```
+
+### Global options
+
+| Option | Description |
+|--------|-------------|
+| `--repo PATH` | Path to the scanned repository (defaults to `.`) |
+| `--store PATH` | Path to the SQLite store file (overrides default) |
+| `--format json\|markdown` | Output format (defaults to `json`) |
+| `--output PATH` | Write output to a file instead of stdout |
+
+All output is structured JSON by default, making it easy for scripts and agents to consume.
+Errors are also structured JSON (written to stderr) with a `code`, `message`, and `details` fields.
 
 ## MCP Server
 
@@ -151,7 +252,7 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-### Available Tools
+### Available MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -171,6 +272,10 @@ By default, `tablebrief` stores scans in a local SQLite database at:
 - Windows: `%LOCALAPPDATA%\\tablebrief\\store.db`
 
 Override the database location per command with `--store <path>`.
+
+Scanning is **idempotent**: if the repo files haven't changed since the last scan (based on a
+content hash of all input files), the existing catalog is reused and the response includes
+`"reused": true`.
 
 ## Example Brief
 
@@ -207,25 +312,27 @@ Override the database location per command with `--store <path>`.
 }
 ```
 
-## Example Scan Result
+## Supported Repository Layouts
 
-```json
-{
-  "repo_key": "d3683f03e2bb42b259baecf27e52042d9faeb8abe60caa45e79ae9d974180f5a",
-  "repo_root": "/path/to/repo",
-  "effective_root": "/path/to/repo/dbt_clickhouse",
-  "project_type": "dbt",
-  "scan_id": 1,
-  "status": "complete",
-  "reused": false,
-  "brief_count": 3,
-  "tables": [
-    "mart.daily_active_users",
-    "mart.daily_active_users_all",
-    "staging.stg_events"
-  ],
-  "generated_at": "2026-03-07T04:07:09.663114Z"
-}
+| Layout | How tablebrief detects it | What gets scanned |
+|--------|--------------------------|-------------------|
+| **Single dbt project** | `dbt_project.yml` at root | `models/**/*.sql` + `*.yml` metadata |
+| **Monorepo with nested dbt** | Exactly one `dbt_project.yml` in a subdirectory | That subdirectory's `models/**/*.sql` |
+| **Multi-dbt monorepo** | Multiple `dbt_project.yml` files | Error -- scan one subdirectory directly |
+| **Plain SQL repo** | No `dbt_project.yml`, but `.sql` files exist | All `**/*.sql` + `*.yml` metadata |
+
+Use `--project-type dbt` or `--project-type sql` to skip auto-detection.
+
+## Project Architecture
+
+```
+src/agent_table_brief/
+├── cli.py          # Typer CLI commands and option definitions
+├── models.py       # Pydantic schemas (TableBrief, Catalog, ScanResult, etc.)
+├── repository.py   # Scanning logic: discovery, SQL parsing, heuristic inference
+├── storage.py      # SQLite store: read/write scans, FTS5 search, GC
+├── render.py       # JSON and Markdown output formatting
+└── mcp_server.py   # MCP server exposing catalog as AI-editor tools
 ```
 
 ## OpenSpec Workflow
@@ -265,10 +372,10 @@ Baseline source-of-truth specs live under `openspec/specs/`.
 Quality checks:
 
 ```bash
-uv run ruff check .
-uv run mypy src
-uv run pytest
-openspec validate --specs
+uv run ruff check .          # lint
+uv run mypy src              # type check
+uv run pytest                # tests
+openspec validate --specs    # spec validation
 ```
 
 ## Limitations
