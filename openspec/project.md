@@ -13,6 +13,7 @@ evidence-backed table briefs for coding agents and humans.
 - `pydantic` for public schemas
 - `sqlglot` for SQL parsing
 - `PyYAML` for YAML metadata
+- `mcp` for the MCP server (optional)
 - `pytest`, `ruff`, `mypy` for quality gates
 
 ## Conventions
