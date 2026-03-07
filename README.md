@@ -218,7 +218,12 @@ Override the database location per command with `--store <path>`.
   "scan_id": 1,
   "status": "complete",
   "reused": false,
-  "brief_count": 914,
+  "brief_count": 3,
+  "tables": [
+    "mart.daily_active_users",
+    "mart.daily_active_users_all",
+    "staging.stg_events"
+  ],
   "generated_at": "2026-03-07T04:07:09.663114Z"
 }
 ```

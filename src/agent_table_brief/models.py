@@ -56,6 +56,7 @@ class ScanResult(BaseModel):
     status: str
     reused: bool
     brief_count: int
+    tables: list[str] = Field(default_factory=list)
     generated_at: datetime
 
 

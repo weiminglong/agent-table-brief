@@ -8,7 +8,16 @@ from mcp.server.fastmcp import FastMCP
 from agent_table_brief.repository import build_compare_result
 from agent_table_brief.storage import CatalogStore, resolve_store_path
 
-mcp = FastMCP("tablebrief")
+mcp = FastMCP(
+    "tablebrief",
+    instructions=(
+        "tablebrief provides table-level context for analytics repositories. "
+        "Use search_tables to find tables by intent, get_brief for full detail "
+        "on a specific table, compare_tables to diff similar tables, "
+        "list_tables for a catalog overview, and list_repos to see scanned repositories. "
+        "All data comes from a local scan — no warehouse connection required."
+    ),
+)
 
 
 def _store() -> CatalogStore:
@@ -19,9 +28,17 @@ def _store() -> CatalogStore:
 
 @mcp.tool()
 def search_tables(query: str, repo: str | None = None, limit: int = 10) -> str:
-    """Search for tables by keyword across purpose, grain, filters, and names.
+    """Search for tables by keyword across purpose, grain, filters, and table names.
 
-    Returns ranked results from the stored catalog.
+    Use this as the starting point when you need to find the right table for a query.
+    Results are ranked by BM25 relevance. Each hit includes the full brief with
+    purpose, grain, keys, dependencies, filters, freshness, alternatives, confidence,
+    and evidence.
+
+    Args:
+        query: Natural language search terms (e.g. "daily active users").
+        repo: Path to the scanned repository. Omit to use the current directory.
+        limit: Maximum number of results to return.
     """
     store = _store()
     repo_path = Path(repo) if repo else None
@@ -33,8 +50,14 @@ def search_tables(query: str, repo: str | None = None, limit: int = 10) -> str:
 def get_brief(table: str, repo: str | None = None) -> str:
     """Get the full brief for a specific table.
 
-    Returns purpose, grain, keys, dependencies, exclusions, freshness,
-    alternatives, confidence, and evidence.
+    Returns purpose, grain, primary_keys, derived_from, filters_or_exclusions,
+    freshness_hints, downstream_usage, alternatives, confidence, field_confidence,
+    and evidence. Use the fully qualified name (e.g. "mart.daily_active_users")
+    or the short name if unambiguous.
+
+    Args:
+        table: Table name, e.g. "mart.daily_active_users" or "daily_active_users".
+        repo: Path to the scanned repository. Omit to use the current directory.
     """
     store = _store()
     repo_path = Path(repo) if repo else None
@@ -46,7 +69,14 @@ def get_brief(table: str, repo: str | None = None) -> str:
 def compare_tables(tables: list[str], repo: str | None = None) -> str:
     """Compare two or more tables side-by-side.
 
-    Returns a structured diff highlighting shared and diverging fields.
+    Returns each table's full brief plus a differences dict that maps diverging
+    field names (purpose, grain, primary_keys, filters_or_exclusions, etc.) to
+    the distinct values across the compared tables. Use this when you need to
+    decide between similar tables.
+
+    Args:
+        tables: Two or more table names to compare.
+        repo: Path to the scanned repository. Omit to use the current directory.
     """
     store = _store()
     repo_path = Path(repo) if repo else None
@@ -59,7 +89,12 @@ def compare_tables(tables: list[str], repo: str | None = None) -> str:
 def list_tables(repo: str | None = None) -> str:
     """List all tables in the stored catalog for a repository.
 
-    Returns table names with purpose and confidence.
+    Returns an array of objects with table (name), purpose (string), and
+    confidence (float 0-1). Use this to get a quick overview before calling
+    get_brief on specific tables.
+
+    Args:
+        repo: Path to the scanned repository. Omit to use the current directory.
     """
     store = _store()
     repo_path = Path(repo) if repo else None
@@ -75,7 +110,12 @@ def list_tables(repo: str | None = None) -> str:
 
 @mcp.tool()
 def list_repos() -> str:
-    """List all scanned repositories in the catalog store."""
+    """List all scanned repositories in the catalog store.
+
+    Returns an array of objects with repo_key, repo_root, effective_root,
+    project_type, brief_count, and generated_at. Call this first if you are
+    unsure which repository to query.
+    """
     store = _store()
     summaries = store.list_repos()
     import json

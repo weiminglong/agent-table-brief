@@ -82,23 +82,26 @@ class CatalogStore:
                 (repo_id, fingerprint, catalog.version),
             ).fetchone()
             if existing_row is not None:
+                existing_scan_id = int(existing_row["id"])
                 self._set_active_repo_scan(
                     connection,
                     repo_id,
-                    int(existing_row["id"]),
+                    existing_scan_id,
                     identity,
                     catalog.project_type,
                 )
                 generated_at = _parse_timestamp(existing_row["generated_at"])
+                table_names = self._load_table_names(connection, existing_scan_id)
                 return ScanResult(
                     repo_key=identity.repo_key,
                     repo_root=identity.repo_root,
                     effective_root=identity.effective_root,
                     project_type=catalog.project_type,
-                    scan_id=int(existing_row["id"]),
+                    scan_id=existing_scan_id,
                     status="complete",
                     reused=True,
                     brief_count=int(existing_row["brief_count"]),
+                    tables=table_names,
                     generated_at=generated_at,
                 )
 
@@ -148,6 +151,7 @@ class CatalogStore:
             status="complete",
             reused=False,
             brief_count=len(catalog.briefs),
+            tables=sorted(b.table for b in catalog.briefs),
             generated_at=catalog.generated_at,
         )
 
@@ -603,6 +607,15 @@ class CatalogStore:
         if row is None:
             raise RepoNotScannedError(f"No active scan found for repo id: {repo_id}")
         return cast(sqlite3.Row, row)
+
+    def _load_table_names(
+        self, connection: sqlite3.Connection, scan_id: int
+    ) -> list[str]:
+        rows = connection.execute(
+            "SELECT table_name FROM briefs WHERE scan_id = ? ORDER BY table_name ASC",
+            (scan_id,),
+        ).fetchall()
+        return [str(row["table_name"]) for row in rows]
 
     def _load_briefs(self, scan_id: int) -> list[TableBrief]:
         with self._connect() as connection:
