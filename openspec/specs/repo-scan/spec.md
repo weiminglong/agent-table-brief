@@ -28,6 +28,13 @@ The system SHALL write scan results to a local SQLite-backed catalog store.
 - WHEN the same repository is scanned multiple times without file changes
 - THEN the scanner reuses the active stored scan instead of duplicating brief rows
 
+### Requirement: Full-Text Search Index
+The system SHALL populate an FTS5 full-text index at scan time so briefs are searchable.
+
+#### Scenario: FTS index populated
+- WHEN a scan completes successfully
+- THEN the FTS index contains entries for each brief's table name, purpose, grain, filters, and alternatives
+
 ### Requirement: Repo-Native Metadata
 The system SHALL derive context from repository files without requiring warehouse access.
 

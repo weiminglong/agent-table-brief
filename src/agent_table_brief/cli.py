@@ -7,7 +7,14 @@ from typing import Annotated, Any
 
 import typer
 
-from agent_table_brief.models import Catalog, CliError, CompareResult, RepoSummary, TableBrief
+from agent_table_brief.models import (
+    Catalog,
+    CliError,
+    CompareResult,
+    RepoSummary,
+    SearchResult,
+    TableBrief,
+)
 from agent_table_brief.render import (
     render_brief_json,
     render_brief_markdown,
@@ -15,6 +22,8 @@ from agent_table_brief.render import (
     render_catalog_markdown,
     render_compare_json,
     render_compare_markdown,
+    render_search_json,
+    render_search_markdown,
 )
 from agent_table_brief.repository import build_compare_result, scan_repository
 from agent_table_brief.storage import (
@@ -40,20 +49,45 @@ class OutputFormat(StrEnum):
 
 RepoArgument = Annotated[
     Path,
-    typer.Argument(exists=True, file_okay=False, resolve_path=True),
+    typer.Argument(exists=True, file_okay=False, resolve_path=True, help="Path to the repository."),
 ]
 RepoOption = Annotated[
     Path | None,
-    typer.Option("--repo", exists=True, file_okay=False, resolve_path=True),
+    typer.Option(
+        "--repo",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Path to the scanned repository. Defaults to the current directory.",
+    ),
 ]
-StoreOption = Annotated[Path | None, typer.Option("--store", dir_okay=False, resolve_path=True)]
-OutputOption = Annotated[Path | None, typer.Option("--output")]
-FormatOption = Annotated[OutputFormat, typer.Option("--format")]
-ProjectTypeOption = Annotated[ProjectType, typer.Option("--project-type")]
-TableArgument = Annotated[str, typer.Argument()]
+StoreOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--store",
+        dir_okay=False,
+        resolve_path=True,
+        help="Path to the SQLite store. Defaults to the platform state directory.",
+    ),
+]
+OutputOption = Annotated[
+    Path | None, typer.Option("--output", help="Write output to this file instead of stdout.")
+]
+FormatOption = Annotated[
+    OutputFormat, typer.Option("--format", help="Output format: json (default) or markdown.")
+]
+ProjectTypeOption = Annotated[
+    ProjectType, typer.Option("--project-type", help="Force project type: auto, dbt, or sql.")
+]
+TableArgument = Annotated[
+    str, typer.Argument(help="Fully qualified table name (e.g. mart.daily_active_users).")
+]
+QueryArgument = Annotated[
+    str, typer.Argument(help="Search query (e.g. 'daily active users').")
+]
 
 
-@app.command()
+@app.command(help="Scan a dbt or SQL repository and store table briefs locally.")
 def scan(
     path: RepoArgument = Path("."),
     project_type: ProjectTypeOption = ProjectType.auto,
@@ -67,7 +101,11 @@ def scan(
     typer.echo(result.model_dump_json(indent=2))
 
 
-@app.command()
+@app.command(
+    help="Retrieve the brief for a single table."
+    " Returns purpose, grain, keys, dependencies, filters, freshness,"
+    " alternatives, confidence, and evidence.",
+)
 def brief(
     table: TableArgument,
     repo: RepoOption = None,
@@ -89,7 +127,10 @@ def brief(
     typer.echo(_render_brief(table_brief, format))
 
 
-@app.command()
+@app.command(
+    help="Compare two or more tables side-by-side."
+    " Returns a structured diff of diverging fields.",
+)
 def compare(
     tables: Annotated[list[str], typer.Argument(min=2)],
     repo: RepoOption = None,
@@ -115,7 +156,29 @@ def compare(
     typer.echo(_render_compare(result, format))
 
 
-@app.command()
+@app.command(
+    help="Search for tables by keyword."
+    " Returns ranked results matching purpose, grain, filters, or table names.",
+)
+def search(
+    query: QueryArgument,
+    repo: RepoOption = None,
+    store: StoreOption = None,
+    format: FormatOption = OutputFormat.json,
+    limit: Annotated[int, typer.Option("--limit")] = 10,
+) -> None:
+    try:
+        result = _store(store).search(query, repo_path=repo, limit=limit)
+    except RepoNotScannedError as exc:
+        _fail("repo_not_scanned", str(exc), {"repo": _repo_detail(repo)})
+    except RepoAmbiguousError as exc:
+        _fail("repo_ambiguous", str(exc), {"repo": _repo_detail(repo)})
+    except Exception as exc:
+        _fail("search_failed", str(exc), {"query": query, "repo": _repo_detail(repo)})
+    typer.echo(_render_search(result, format))
+
+
+@app.command(help="Export the full stored catalog as JSON or Markdown.")
 def export(
     repo: RepoOption = None,
     store: StoreOption = None,
@@ -139,7 +202,7 @@ def export(
     typer.echo(json.dumps({"output": str(output), "format": format.value}, indent=2))
 
 
-@app.command()
+@app.command(help="List all scanned repositories in the store.")
 def repos(store: StoreOption = None) -> None:
     try:
         summaries = _store(store).list_repos()
@@ -148,7 +211,7 @@ def repos(store: StoreOption = None) -> None:
     typer.echo(_render_json_list(summaries))
 
 
-@app.command()
+@app.command(help="Remove old scans beyond the retention limit.")
 def gc(store: StoreOption = None) -> None:
     try:
         result = _store(store).gc()
@@ -157,13 +220,32 @@ def gc(store: StoreOption = None) -> None:
     typer.echo(result.model_dump_json(indent=2))
 
 
-@app.command()
+@app.command(help="Reclaim unused space in the SQLite store.")
 def vacuum(store: StoreOption = None) -> None:
     try:
         result = _store(store).vacuum()
     except Exception as exc:
         _fail("vacuum_failed", str(exc))
     typer.echo(result.model_dump_json(indent=2))
+
+
+@app.command(
+    help="Start the MCP server so AI editors and agents can query table briefs"
+    " over the Model Context Protocol.",
+)
+def serve(store: StoreOption = None) -> None:
+    if store is not None:
+        import os
+
+        os.environ["TABLEBRIEF_STORE"] = str(store.resolve())
+    try:
+        from agent_table_brief.mcp_server import run_server
+    except ImportError:
+        _fail(
+            "missing_dependency",
+            'The "mcp" package is required. Install with: uv pip install "agent-table-brief[mcp]"',
+        )
+    run_server()
 
 
 def main() -> None:
@@ -184,6 +266,12 @@ def _render_compare(result: CompareResult, format: OutputFormat) -> str:
     if format is OutputFormat.markdown:
         return render_compare_markdown(result)
     return render_compare_json(result)
+
+
+def _render_search(result: SearchResult, format: OutputFormat) -> str:
+    if format is OutputFormat.markdown:
+        return render_search_markdown(result)
+    return render_search_json(result)
 
 
 def _render_catalog(catalog: Catalog, format: OutputFormat) -> str:

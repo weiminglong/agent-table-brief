@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from agent_table_brief.models import (
     MaintenanceResult,
     RepoSummary,
     ScanResult,
+    SearchHit,
+    SearchResult,
     TableBrief,
 )
 from agent_table_brief.repository import (
@@ -79,23 +82,26 @@ class CatalogStore:
                 (repo_id, fingerprint, catalog.version),
             ).fetchone()
             if existing_row is not None:
+                existing_scan_id = int(existing_row["id"])
                 self._set_active_repo_scan(
                     connection,
                     repo_id,
-                    int(existing_row["id"]),
+                    existing_scan_id,
                     identity,
                     catalog.project_type,
                 )
                 generated_at = _parse_timestamp(existing_row["generated_at"])
+                table_names = self._load_table_names(connection, existing_scan_id)
                 return ScanResult(
                     repo_key=identity.repo_key,
                     repo_root=identity.repo_root,
                     effective_root=identity.effective_root,
                     project_type=catalog.project_type,
-                    scan_id=int(existing_row["id"]),
+                    scan_id=existing_scan_id,
                     status="complete",
                     reused=True,
                     brief_count=int(existing_row["brief_count"]),
+                    tables=table_names,
                     generated_at=generated_at,
                 )
 
@@ -145,6 +151,7 @@ class CatalogStore:
             status="complete",
             reused=False,
             brief_count=len(catalog.briefs),
+            tables=sorted(b.table for b in catalog.briefs),
             generated_at=catalog.generated_at,
         )
 
@@ -184,6 +191,43 @@ class CatalogStore:
             raise KeyError(f"Table not found in catalog: {table_name}")
         finally:
             connection.close()
+
+    def search(
+        self,
+        query: str,
+        repo_path: Path | None = None,
+        limit: int = 10,
+    ) -> SearchResult:
+        repo_row = self._resolve_repo_row(repo_path)
+        scan_row = self._active_scan_row(repo_row["id"])
+        scan_id = int(scan_row["id"])
+        escaped_query = _escape_fts_query(query)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    briefs_fts.table_name,
+                    bm25(briefs_fts) AS rank,
+                    briefs.payload_json
+                FROM briefs_fts
+                JOIN briefs
+                    ON briefs.table_name = briefs_fts.table_name
+                    AND briefs.scan_id = ?
+                WHERE briefs_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (scan_id, escaped_query, limit),
+            ).fetchall()
+        hits = [
+            SearchHit(
+                table=str(row["table_name"]),
+                rank=-float(row["rank"]),
+                brief=TableBrief.model_validate_json(str(row["payload_json"])),
+            )
+            for row in rows
+        ]
+        return SearchResult(query=query, hits=hits)
 
     def list_repos(self) -> list[RepoSummary]:
         with self._connect() as connection:
@@ -306,6 +350,15 @@ class CatalogStore:
                 CREATE INDEX IF NOT EXISTS idx_briefs_scan_short_name
                 ON briefs(scan_id, short_name);
                 CREATE INDEX IF NOT EXISTS idx_evidence_scan_table ON evidence(scan_id, table_name);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS briefs_fts USING fts5(
+                    table_name,
+                    purpose,
+                    grain,
+                    filters,
+                    alternatives,
+                    tokenize='unicode61'
+                );
                 """
             )
 
@@ -427,6 +480,20 @@ class CatalogStore:
             """,
             evidence_rows,
         )
+        fts_rows: list[tuple[str, str | None, str | None, str, str]] = []
+        for brief in briefs:
+            fts_rows.append((
+                brief.table,
+                brief.purpose,
+                brief.grain,
+                ", ".join(brief.filters_or_exclusions),
+                ", ".join(brief.alternatives),
+            ))
+        connection.executemany(
+            "INSERT INTO briefs_fts (table_name, purpose, grain, filters, alternatives)"
+            " VALUES (?, ?, ?, ?, ?)",
+            fts_rows,
+        )
 
     def _set_active_repo_scan(
         self,
@@ -541,6 +608,15 @@ class CatalogStore:
             raise RepoNotScannedError(f"No active scan found for repo id: {repo_id}")
         return cast(sqlite3.Row, row)
 
+    def _load_table_names(
+        self, connection: sqlite3.Connection, scan_id: int
+    ) -> list[str]:
+        rows = connection.execute(
+            "SELECT table_name FROM briefs WHERE scan_id = ? ORDER BY table_name ASC",
+            (scan_id,),
+        ).fetchall()
+        return [str(row["table_name"]) for row in rows]
+
     def _load_briefs(self, scan_id: int) -> list[TableBrief]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -643,6 +719,16 @@ def _parse_timestamp(value: str) -> datetime:
 
 def _isoformat_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _escape_fts_query(query: str) -> str:
+    tokens = query.split()
+    escaped: list[str] = []
+    for token in tokens:
+        cleaned = re.sub(r"[^\w]", "", token)
+        if cleaned:
+            escaped.append(f'"{cleaned}"')
+    return " OR ".join(escaped) if escaped else '""'
 
 
 def _run_git(path: Path, *args: str) -> str | None:

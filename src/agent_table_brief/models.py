@@ -56,6 +56,7 @@ class ScanResult(BaseModel):
     status: str
     reused: bool
     brief_count: int
+    tables: list[str] = Field(default_factory=list)
     generated_at: datetime
 
 
@@ -71,6 +72,17 @@ class RepoSummary(BaseModel):
 class MaintenanceResult(BaseModel):
     repos_considered: int
     scans_removed: int
+
+
+class SearchHit(BaseModel):
+    table: str
+    rank: float
+    brief: TableBrief
+
+
+class SearchResult(BaseModel):
+    query: str
+    hits: list[SearchHit]
 
 
 class CliError(BaseModel):

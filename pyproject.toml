@@ -37,6 +37,9 @@ Homepage = "https://github.com/weiminglong/agent-table-brief"
 Repository = "https://github.com/weiminglong/agent-table-brief"
 Issues = "https://github.com/weiminglong/agent-table-brief/issues"
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+
 [dependency-groups]
 dev = [
     "mypy>=1.18.0",
@@ -59,3 +62,11 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 python_version = "3.12"
 strict = true
 packages = ["agent_table_brief"]
+
+[[tool.mypy.overrides]]
+module = "agent_table_brief.mcp_server"
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = "mcp.*"
+ignore_missing_imports = true

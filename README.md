@@ -24,27 +24,23 @@ That context often lives in code, comments, tests, YAML, naming patterns, and li
 schemas. `agent-table-brief` extracts that context into a local catalog that humans and coding
 agents can reuse.
 
-## MVP Surface
+## Features
 
-`tablebrief` currently supports:
+`tablebrief` scans dbt projects, plain SQL repositories, and YAML metadata files. It uses
+comments, naming conventions, lineage, tests, and filter heuristics to produce briefs containing:
 
-- dbt projects
-- plain SQL repositories
-- YAML metadata files using dbt-style `models:` or `tables:` entries
-- comments, naming conventions, lineage, tests, and filter heuristics
+- purpose, grain, and likely keys
+- upstream dependencies and downstream usage
+- freshness hints and common exclusions/filters
+- likely alternate tables with similarity scoring
+- per-field confidence scores
+- evidence links back to files and line ranges
 
-It produces:
+Beyond scanning, `tablebrief` also provides:
 
-- purpose
-- grain
-- likely keys
-- upstream dependencies
-- downstream usage
-- freshness hints
-- common exclusions and filters
-- likely alternate tables
-- confidence score
-- evidence links back to files and lines
+- **compare**: side-by-side structured diff of two or more tables
+- **search**: full-text search over the catalog using SQLite FTS5
+- **MCP server**: expose the catalog to AI editors and agents via the Model Context Protocol
 
 ## Install
 
@@ -82,6 +78,19 @@ Export the active stored catalog:
 uv run tablebrief export --repo path/to/repo --format markdown --output briefs.md
 ```
 
+Compare two or more tables side-by-side:
+
+```bash
+uv run tablebrief compare mart.daily_active_users mart.daily_active_users_all \
+  --repo path/to/repo --format json
+```
+
+Search for tables by keyword:
+
+```bash
+uv run tablebrief search "daily active users" --repo path/to/repo --format json --limit 10
+```
+
 List scanned repositories:
 
 ```bash
@@ -94,6 +103,63 @@ Maintenance commands:
 uv run tablebrief gc
 uv run tablebrief vacuum
 ```
+
+## MCP Server
+
+`tablebrief` includes an optional [Model Context Protocol](https://modelcontextprotocol.io)
+server so AI editors and agents can query table briefs directly.
+
+Install the MCP extra:
+
+```bash
+uv pip install "agent-table-brief[mcp]"
+```
+
+Start the server:
+
+```bash
+uv run tablebrief serve
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "tablebrief": {
+      "command": "uv",
+      "args": ["run", "tablebrief", "serve"]
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "tablebrief": {
+      "command": "uv",
+      "args": ["run", "tablebrief", "serve"]
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_tables` | Search tables by keyword across purpose, grain, filters, and names |
+| `get_brief` | Get the full brief for a specific table |
+| `compare_tables` | Compare two or more tables side-by-side |
+| `list_tables` | List all tables in a scanned repository |
+| `list_repos` | List all scanned repositories |
 
 ## Storage
 
@@ -120,6 +186,16 @@ Override the database location per command with `--store <path>`.
   "downstream_usage": ["kpi.weekly_growth", "retention_dashboard"],
   "alternatives": ["mart.daily_active_users_all", "mart.session_users"],
   "confidence": 0.73,
+  "field_confidence": {
+    "purpose": 0.95,
+    "grain": 0.95,
+    "primary_keys": 0.95,
+    "derived_from": 0.95,
+    "filters_or_exclusions": 0.9,
+    "freshness_hints": 0.9,
+    "downstream_usage": 0.9,
+    "alternatives": 0.8
+  },
   "evidence": [
     {
       "file": "models/mart/daily_active_users.sql",
@@ -142,7 +218,12 @@ Override the database location per command with `--store <path>`.
   "scan_id": 1,
   "status": "complete",
   "reused": false,
-  "brief_count": 914,
+  "brief_count": 3,
+  "tables": [
+    "mart.daily_active_users",
+    "mart.daily_active_users_all",
+    "staging.stg_events"
+  ],
   "generated_at": "2026-03-07T04:07:09.663114Z"
 }
 ```
@@ -192,7 +273,7 @@ openspec validate --specs
 
 ## Limitations
 
-At least in v0.1, `agent-table-brief` does not try to:
+`agent-table-brief` does not try to:
 
 - replace warehouse documentation tools
 - guarantee true business meaning
@@ -204,9 +285,9 @@ It is a context extraction tool, not a warehouse agent.
 
 ## Roadmap
 
-- v0.1: repo scan, dbt model discovery, SQLite-backed local store, brief/export
-- v0.2: better alternatives, compare command, stronger evidence mapping, confidence scoring
-- v0.3: semantic search, editor integrations, MCP server, optional warehouse metadata fusion
+- v0.1: repo scan, dbt model discovery, SQLite-backed local store, brief/export *(shipped)*
+- v0.2: better alternatives, compare command, stronger evidence mapping, confidence scoring *(shipped)*
+- v0.3: full-text search, MCP server *(shipped)*, editor integrations, optional warehouse metadata fusion
 
 ## Contributing
 

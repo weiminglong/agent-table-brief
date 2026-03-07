@@ -20,7 +20,10 @@ uv run pytest             # tests
 uv run tablebrief --help
 uv run tablebrief scan <path-to-repo>
 uv run tablebrief brief <table-name> --repo <path> --format json
+uv run tablebrief compare <tableA> <tableB> --repo <path> --format json
+uv run tablebrief search "<query>" --repo <path> --format json --limit 10
 uv run tablebrief export --repo <path> --format markdown
+uv run tablebrief serve                        # start MCP server (requires mcp extra)
 ```
 
 Test fixtures at `tests/fixtures/` (dbt_project, sql_repo, monorepo_with_dbt, multi_dbt_monorepo) are useful for manual CLI testing.
