@@ -33,9 +33,7 @@ IGNORED_DIRS = {
 }
 
 DBT_REF_RE = re.compile(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)")
-DBT_SOURCE_RE = re.compile(
-    r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)"
-)
+DBT_SOURCE_RE = re.compile(r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)")
 DBT_CONFIG_RE = re.compile(r"\{\{\s*config\((?P<body>.*?)\)\s*\}\}", re.DOTALL)
 KEY_VALUE_RE = re.compile(r"(?P<key>\w+)\s*=\s*['\"](?P<value>[^'\"]+)['\"]")
 JINJA_RE = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.DOTALL)
@@ -326,9 +324,7 @@ def _build_brief(
         downstream_score,
         alternatives_score,
     )
-    evidence = _dedupe_evidence(
-        [evidence for refs in field_evidence.values() for evidence in refs]
-    )
+    evidence = _dedupe_evidence([evidence for refs in field_evidence.values() for evidence in refs])
     return TableBrief(
         table=model.table,
         purpose=purpose,
@@ -374,9 +370,7 @@ def _infer_grain(model: DiscoveredModel) -> tuple[str | None, float, list[Eviden
         ]
         return grain_text, 0.85, evidence
     key_like_columns = [
-        column
-        for column in sorted(model.unique_columns)
-        if column.endswith(("_id", "_key"))
+        column for column in sorted(model.unique_columns) if column.endswith(("_id", "_key"))
     ]
     if key_like_columns:
         grain_text = " x ".join(key_like_columns)
@@ -403,9 +397,7 @@ def _infer_primary_keys(
         evidence = [_make_file_evidence(model.relative_path, model.sql_text, "yaml")]
         return unique_and_required, 0.9, evidence
     group_by_keys = [
-        column
-        for column in model.group_by
-        if column.endswith(("_id", "_key", "_date"))
+        column for column in model.group_by if column.endswith(("_id", "_key", "_date"))
     ]
     if group_by_keys:
         fragment = group_by_keys[0]
@@ -696,8 +688,7 @@ def _parse_config(sql_text: str) -> dict[str, str]:
 def _extract_raw_dependencies(sql_text: str, insights: SqlInsights) -> list[str]:
     dependencies = [match.group(1) for match in DBT_REF_RE.finditer(sql_text)]
     dependencies.extend(
-        f"{match.group(1)}.{match.group(2)}"
-        for match in DBT_SOURCE_RE.finditer(sql_text)
+        f"{match.group(1)}.{match.group(2)}" for match in DBT_SOURCE_RE.finditer(sql_text)
     )
     dependencies.extend(sorted(insights.table_refs))
     return sorted(dict.fromkeys(dependencies))
@@ -797,7 +788,7 @@ def _extract_sql_insights(cleaned_sql: str) -> SqlInsights:
     if expression is None:
         return SqlInsights()
     cte_names = {cte.alias_or_name for cte in expression.find_all(exp.CTE)}
-    table_refs = set()
+    table_refs: set[str] = set()
     for table in expression.find_all(exp.Table):
         reference = ".".join(part for part in (table.catalog, table.db, table.name) if part)
         if table.name not in cte_names and reference:
@@ -805,11 +796,25 @@ def _extract_sql_insights(cleaned_sql: str) -> SqlInsights:
     group_by: list[str] = []
     group = expression.args.get("group")
     if isinstance(group, exp.Group):
-        group_by = [
-            _normalize_identifier(item_sql)
-            for item in group.expressions
-            if (item_sql := _safe_expression_sql(item))
-        ]
+        select_columns: list[str] = []
+        select_expr = expression.args.get("select")
+        if isinstance(select_expr, exp.Select):
+            for col in select_expr.expressions:
+                col_sql = _safe_expression_sql(col)
+                if col_sql:
+                    select_columns.append(_normalize_identifier(col_sql))
+        for item in group.expressions:
+            item_sql = _safe_expression_sql(item)
+            if not item_sql:
+                continue
+            normalized = _normalize_identifier(item_sql)
+            if normalized.isdigit():
+                idx = int(normalized) - 1
+                if 0 <= idx < len(select_columns):
+                    group_by.append(select_columns[idx])
+                # else: ordinal exceeds select columns, skip it
+            else:
+                group_by.append(normalized)
     where_clauses = [
         clause_sql
         for where in expression.find_all(exp.Where)
