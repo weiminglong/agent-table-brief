@@ -6,13 +6,15 @@ import re
 import sqlite3
 import subprocess
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from agent_table_brief.models import (
     Catalog,
+    EvidenceRef,
     MaintenanceResult,
     RepoSummary,
     ScanResult,
@@ -212,12 +214,13 @@ class CatalogStore:
                 FROM briefs_fts
                 JOIN briefs
                     ON briefs.table_name = briefs_fts.table_name
-                    AND briefs.scan_id = ?
+                    AND briefs.scan_id = briefs_fts.scan_id
                 WHERE briefs_fts MATCH ?
+                    AND briefs_fts.scan_id = ?
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (scan_id, escaped_query, limit),
+                (escaped_query, scan_id, limit),
             ).fetchall()
         hits = [
             SearchHit(
@@ -352,6 +355,7 @@ class CatalogStore:
                 CREATE INDEX IF NOT EXISTS idx_evidence_scan_table ON evidence(scan_id, table_name);
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS briefs_fts USING fts5(
+                    scan_id,
                     table_name,
                     purpose,
                     grain,
@@ -480,18 +484,21 @@ class CatalogStore:
             """,
             evidence_rows,
         )
-        fts_rows: list[tuple[str, str | None, str | None, str, str]] = []
+        fts_rows: list[tuple[int, str, str | None, str | None, str, str]] = []
         for brief in briefs:
-            fts_rows.append((
-                brief.table,
-                brief.purpose,
-                brief.grain,
-                ", ".join(brief.filters_or_exclusions),
-                ", ".join(brief.alternatives),
-            ))
+            fts_rows.append(
+                (
+                    scan_id,
+                    brief.table,
+                    brief.purpose,
+                    brief.grain,
+                    ", ".join(brief.filters_or_exclusions),
+                    ", ".join(brief.alternatives),
+                )
+            )
         connection.executemany(
-            "INSERT INTO briefs_fts (table_name, purpose, grain, filters, alternatives)"
-            " VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO briefs_fts (scan_id, table_name, purpose, grain, filters, alternatives)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             fts_rows,
         )
 
@@ -545,6 +552,11 @@ class CatalogStore:
         if not removable:
             return 0
         placeholders = ", ".join("?" for _ in removable)
+        for scan_id in removable:
+            connection.execute(
+                "DELETE FROM briefs_fts WHERE scan_id = ?",
+                (scan_id,),
+            )
         connection.execute(
             f"DELETE FROM scans WHERE id IN ({placeholders})",
             removable,
@@ -608,9 +620,7 @@ class CatalogStore:
             raise RepoNotScannedError(f"No active scan found for repo id: {repo_id}")
         return cast(sqlite3.Row, row)
 
-    def _load_table_names(
-        self, connection: sqlite3.Connection, scan_id: int
-    ) -> list[str]:
+    def _load_table_names(self, connection: sqlite3.Connection, scan_id: int) -> list[str]:
         rows = connection.execute(
             "SELECT table_name FROM briefs WHERE scan_id = ? ORDER BY table_name ASC",
             (scan_id,),
@@ -619,16 +629,48 @@ class CatalogStore:
 
     def _load_briefs(self, scan_id: int) -> list[TableBrief]:
         with self._connect() as connection:
-            rows = connection.execute(
+            brief_rows = connection.execute(
                 """
-                SELECT payload_json
+                SELECT table_name, payload_json
                 FROM briefs
                 WHERE scan_id = ?
                 ORDER BY table_name ASC
                 """,
                 (scan_id,),
             ).fetchall()
-        return [TableBrief.model_validate_json(str(row["payload_json"])) for row in rows]
+            evidence_rows = connection.execute(
+                """
+                SELECT table_name, field_name, file, start_line, end_line, kind
+                FROM evidence
+                WHERE scan_id = ?
+                """,
+                (scan_id,),
+            ).fetchall()
+        evidence_by_table: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for row in evidence_rows:
+            table_name = str(row["table_name"])
+            field_name = str(row["field_name"]) if row["field_name"] else ""
+            evidence_by_table[table_name][field_name].append(
+                {
+                    "file": str(row["file"]),
+                    "start_line": int(row["start_line"]),
+                    "end_line": int(row["end_line"]),
+                    "kind": str(row["kind"]),
+                }
+            )
+        briefs: list[TableBrief] = []
+        for row in brief_rows:
+            brief = TableBrief.model_validate_json(str(row["payload_json"]))
+            table_name = brief.table
+            if table_name in evidence_by_table:
+                brief.field_evidence = {
+                    field_name: [EvidenceRef(**ev) for ev in evidence_list]
+                    for field_name, evidence_list in evidence_by_table[table_name].items()
+                }
+            briefs.append(brief)
+        return briefs
 
 
 def _build_repo_identity(path: Path) -> RepoIdentity:
@@ -643,13 +685,16 @@ def _build_repo_identity(path: Path) -> RepoIdentity:
         else "."
     )
     repo_root = str(git_root if git_root is not None else effective_root)
-    stable_parts = [subpath]
+    stable_parts: list[str] = []
     if git_remote_url:
-        stable_parts.insert(0, git_remote_url)
+        stable_parts.append(git_remote_url)
     elif git_root is not None:
-        stable_parts.insert(0, str(git_root))
+        stable_parts.append(str(git_root))
     else:
-        stable_parts.insert(0, str(effective_root))
+        stable_parts.append(str(effective_root))
+    if commit_sha:
+        stable_parts.append(commit_sha[:12])
+    stable_parts.append(subpath)
     stable_identity = "|".join(stable_parts)
     repo_key = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()
     return RepoIdentity(
@@ -692,9 +737,6 @@ def _input_files(root: Path, project_type: str) -> list[Path]:
         dbt_project = root / "dbt_project.yml"
         if dbt_project.exists():
             add_path(dbt_project)
-        manifest_path = root / "target" / "manifest.json"
-        if manifest_path.exists():
-            add_path(manifest_path)
     return sorted(files.values())
 
 
