@@ -448,5 +448,279 @@ def test_search_unscanned_repo_returns_error(tmp_path: Path) -> None:
     assert error["code"] == "repo_not_scanned"
 
 
+def test_lineage_upstream(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "lineage",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--direction",
+            "upstream",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["origin"] == "mart.daily_active_users"
+    assert payload["direction"] == "upstream"
+    tables = [n["table"] for n in payload["nodes"]]
+    assert "staging.stg_events" in tables
+    assert "mart.dim_users" in tables
+
+
+def test_lineage_downstream(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "lineage",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--direction",
+            "downstream",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    tables = [n["table"] for n in payload["nodes"]]
+    assert "kpi.weekly_growth" in tables
+
+
+def test_lineage_both_directions(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "lineage",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    directions = {n["direction"] for n in payload["nodes"]}
+    assert "upstream" in directions
+    assert "downstream" in directions
+
+
+def test_lineage_depth_limit(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "lineage",
+            "staging.stg_events",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--direction",
+            "downstream",
+            "--depth",
+            "1",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["max_depth"] == 1
+    for node in payload["nodes"]:
+        assert node["depth"] <= 1
+
+
+def test_lineage_markdown_output(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "lineage",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "markdown",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "# Lineage:" in result.stdout
+
+
+def test_init_generates_claude_skill(tmp_path: Path) -> None:
+    repo = tmp_path / "project"
+    repo.mkdir()
+    (repo / ".claude").mkdir()
+    result = runner.invoke(
+        app,
+        ["init", str(repo), "--agent", "claude"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert ".claude/skills/tablebrief/SKILL.md" in payload["created"]
+    skill_path = repo / ".claude" / "skills" / "tablebrief" / "SKILL.md"
+    assert skill_path.exists()
+    content = skill_path.read_text()
+    assert "tablebrief" in content.lower()
+
+
+def test_init_generates_cursor_rules(tmp_path: Path) -> None:
+    repo = tmp_path / "project"
+    repo.mkdir()
+    (repo / ".cursor").mkdir()
+    result = runner.invoke(
+        app,
+        ["init", str(repo), "--agent", "cursor"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert ".cursor/rules/tablebrief.md" in payload["created"]
+
+
+def test_init_updates_agents_md(tmp_path: Path) -> None:
+    repo = tmp_path / "project"
+    repo.mkdir()
+    agents_md = repo / "AGENTS.md"
+    agents_md.write_text("# AGENTS\n\nExisting content.\n")
+    result = runner.invoke(
+        app,
+        ["init", str(repo), "--agent", "claude"],
+    )
+    assert result.exit_code == 0
+    content = agents_md.read_text()
+    assert "## Table Context" in content
+    assert "Existing content." in content
+
+
+def test_init_idempotent(tmp_path: Path) -> None:
+    repo = tmp_path / "project"
+    repo.mkdir()
+    (repo / ".claude").mkdir()
+    agents_md = repo / "AGENTS.md"
+    agents_md.write_text("# AGENTS\n")
+    runner.invoke(app, ["init", str(repo), "--agent", "claude"])
+    agents_md.read_text()  # first run
+    runner.invoke(app, ["init", str(repo), "--agent", "claude"])
+    second_content = agents_md.read_text()
+    # Should not duplicate Table Context section
+    assert second_content.count("## Table Context") == 1
+
+
+def test_init_with_scan(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(FIXTURES / "dbt_project"),
+            "--scan",
+            "--agent",
+            "claude",
+            "--store",
+            str(store_path),
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "(scanned)" in payload["created"]
+
+
+def test_search_by_column_name(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "search",
+            "email",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    # "email" column exists on daily_active_users, should be found via FTS column_names
+    tables = [hit["table"] for hit in payload["hits"]]
+    assert any("daily_active_users" in t for t in tables)
+
+
+def test_brief_json_includes_columns_and_joins(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    runner.invoke(
+        app,
+        ["scan", str(FIXTURES / "dbt_project"), "--store", str(store_path)],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "brief",
+            "mart.daily_active_users",
+            "--repo",
+            str(FIXTURES / "dbt_project"),
+            "--store",
+            str(store_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "columns" in payload
+    assert len(payload["columns"]) >= 2
+    assert "joins" in payload
+    assert any(j["to_table"] == "mart.dim_users" for j in payload["joins"])
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)

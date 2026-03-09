@@ -11,6 +11,7 @@ from agent_table_brief.models import (
     Catalog,
     CliError,
     CompareResult,
+    LineageResult,
     RepoSummary,
     SearchResult,
     TableBrief,
@@ -22,10 +23,16 @@ from agent_table_brief.render import (
     render_catalog_markdown,
     render_compare_json,
     render_compare_markdown,
+    render_lineage_json,
+    render_lineage_markdown,
     render_search_json,
     render_search_markdown,
 )
-from agent_table_brief.repository import build_compare_result, scan_repository
+from agent_table_brief.repository import (
+    build_compare_result,
+    enrich_from_db,
+    scan_repository,
+)
 from agent_table_brief.storage import (
     CatalogStore,
     RepoAmbiguousError,
@@ -92,9 +99,22 @@ def scan(
     path: RepoArgument = Path("."),
     project_type: ProjectTypeOption = ProjectType.auto,
     store: StoreOption = None,
+    dsn: Annotated[
+        str | None,
+        typer.Option(
+            "--dsn",
+            help=(
+                "Database connection string for live enrichment. "
+                "Use 'env:VAR_NAME' to read from an environment variable."
+            ),
+        ),
+    ] = None,
 ) -> None:
     try:
         scanned_catalog = scan_repository(path, project_type=project_type.value)
+        if dsn is not None:
+            resolved_dsn = _resolve_dsn(dsn)
+            scanned_catalog = enrich_from_db(scanned_catalog, resolved_dsn)
         result = _store(store).store_scan(scanned_catalog)
     except Exception as exc:
         _fail("scan_failed", str(exc), {"path": str(path)})
@@ -176,6 +196,71 @@ def search(
     except Exception as exc:
         _fail("search_failed", str(exc), {"query": query, "repo": _repo_detail(repo)})
     typer.echo(_render_search(result, format))
+
+
+class LineageDirection(StrEnum):
+    upstream = "upstream"
+    downstream = "downstream"
+    both = "both"
+
+
+@app.command(
+    help="Trace lineage for a table."
+    " Returns upstream dependencies, downstream consumers, or both.",
+)
+def lineage(
+    table: TableArgument,
+    repo: RepoOption = None,
+    store: StoreOption = None,
+    format: FormatOption = OutputFormat.json,
+    direction: Annotated[
+        LineageDirection, typer.Option("--direction", help="Lineage direction.")
+    ] = LineageDirection.both,
+    depth: Annotated[int | None, typer.Option("--depth", help="Max traversal depth.")] = None,
+) -> None:
+    try:
+        result = _store(store).build_lineage(
+            table, direction=direction.value, max_depth=depth, repo_path=repo
+        )
+    except RepoNotScannedError as exc:
+        _fail("repo_not_scanned", str(exc), {"repo": _repo_detail(repo)})
+    except RepoAmbiguousError as exc:
+        _fail("repo_ambiguous", str(exc), {"repo": _repo_detail(repo)})
+    except Exception as exc:
+        _fail("lineage_failed", str(exc), {"table": table, "repo": _repo_detail(repo)})
+    typer.echo(_render_lineage(result, format))
+
+
+@app.command(
+    help="Set up tablebrief for AI agent discovery."
+    " Generates skill files, rules, and AGENTS.md integration.",
+)
+def init(
+    path: RepoArgument = Path("."),
+    scan_repo: Annotated[
+        bool,
+        typer.Option("--scan", help="Also scan the repository after init."),
+    ] = False,
+    agent: Annotated[
+        list[str] | None,
+        typer.Option("--agent", help="Agent to target: claude, cursor, windsurf."),
+    ] = None,
+    store: StoreOption = None,
+) -> None:
+    from agent_table_brief.init_cmd import detect_agents, generate_init_files
+
+    agents = agent if agent else detect_agents(path)
+    if not agents:
+        agents = ["claude"]  # Default to claude if no agents detected
+    created = generate_init_files(path, agents=agents)
+    if scan_repo:
+        try:
+            scanned_catalog = scan_repository(path)
+            _store(store).store_scan(scanned_catalog)
+            created.append("(scanned)")
+        except Exception as exc:
+            _fail("scan_failed", str(exc), {"path": str(path)})
+    typer.echo(json.dumps({"created": created, "agents": agents}, indent=2))
 
 
 @app.command(help="Export the full stored catalog as JSON or Markdown.")
@@ -274,6 +359,12 @@ def _render_search(result: SearchResult, format: OutputFormat) -> str:
     return render_search_json(result)
 
 
+def _render_lineage(result: LineageResult, format: OutputFormat) -> str:
+    if format is OutputFormat.markdown:
+        return render_lineage_markdown(result)
+    return render_lineage_json(result)
+
+
 def _render_catalog(catalog: Catalog, format: OutputFormat) -> str:
     if format is OutputFormat.markdown:
         return render_catalog_markdown(catalog)
@@ -282,6 +373,18 @@ def _render_catalog(catalog: Catalog, format: OutputFormat) -> str:
 
 def _render_json_list(items: list[RepoSummary]) -> str:
     return json.dumps([item.model_dump(mode="json") for item in items], indent=2)
+
+
+def _resolve_dsn(dsn: str) -> str:
+    if dsn.startswith("env:"):
+        import os
+
+        var_name = dsn[4:]
+        value = os.environ.get(var_name)
+        if not value:
+            raise ValueError(f"Environment variable {var_name} is not set")
+        return value
+    return dsn
 
 
 def _repo_detail(repo: Path | None) -> str:

@@ -14,7 +14,16 @@ from sqlglot import exp, parse_one
 from sqlglot.errors import ErrorLevel, ParseError
 
 from agent_table_brief import __version__
-from agent_table_brief.models import Catalog, CompareEntry, CompareResult, EvidenceRef, TableBrief
+from agent_table_brief.models import (
+    Catalog,
+    ColumnInfo,
+    CompareEntry,
+    CompareResult,
+    EvidenceRef,
+    JoinPath,
+    QueryPattern,
+    TableBrief,
+)
 
 IGNORED_DIRS = {
     ".git",
@@ -49,6 +58,14 @@ TIME_HINTS = {
     "monthly": "likely monthly batch",
 }
 NAME_PREFIXES = ("stg_", "int_", "fct_", "dim_", "mart_", "kpi_")
+PII_PATTERNS = {"email", "phone", "ssn", "address", "ip_address", "phone_number", "social_security"}
+
+
+@dataclass
+class YamlColumnMeta:
+    name: str
+    description: str | None = None
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +76,8 @@ class YamlMetadata:
     unique_columns: set[str] = field(default_factory=set)
     not_null_columns: set[str] = field(default_factory=set)
     composite_keys: list[list[str]] = field(default_factory=list)
+    column_meta: list[YamlColumnMeta] = field(default_factory=list)
+    relationship_tests: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -101,6 +120,8 @@ class DiscoveredModel:
     filter_evidence: list[EvidenceRef]
     freshness_evidence: list[EvidenceRef]
     filename_evidence: EvidenceRef
+    yaml_column_meta: list[YamlColumnMeta] = field(default_factory=list)
+    yaml_relationship_tests: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -135,7 +156,8 @@ def scan_repository(root: Path, project_type: str = "auto") -> Catalog:
     downstream = _build_downstream_map(normalized_deps)
     grain_lookup = {model.table: _infer_grain(model)[0] for model in models}
     briefs = [
-        _build_brief(model, models, normalized_deps, downstream, grain_lookup) for model in models
+        _build_brief(model, models, normalized_deps, downstream, grain_lookup, name_lookup)
+        for model in models
     ]
     briefs.sort(key=lambda brief: brief.table)
     return Catalog(
@@ -272,7 +294,165 @@ def _discover_model(
             end_line=1,
             kind="filename",
         ),
+        yaml_column_meta=yaml_meta.column_meta,
+        yaml_relationship_tests=yaml_meta.relationship_tests,
     )
+
+
+def _extract_columns(model: DiscoveredModel) -> list[ColumnInfo]:
+    """Extract columns from YAML metadata and SQL SELECT list."""
+    columns: dict[str, ColumnInfo] = {}
+    # YAML columns (highest confidence)
+    for col_meta in model.yaml_column_meta:
+        tags = list(col_meta.tags)
+        if any(p in col_meta.name.lower() for p in PII_PATTERNS) and "pii" not in tags:
+            tags.append("pii")
+        if any("pii" in t.lower() for t in col_meta.tags) and "pii" not in tags:
+            tags.append("pii")
+        columns[col_meta.name] = ColumnInfo(
+            name=col_meta.name,
+            description=col_meta.description,
+            tags=tags,
+            confidence=0.95,
+        )
+    # SQL SELECT columns (lower confidence, fill gaps)
+    cleaned = _clean_sql_for_parsing(model.sql_text)
+    try:
+        expr = parse_one(cleaned, error_level=ErrorLevel.IGNORE)
+    except ParseError:
+        expr = None
+    if expr is not None:
+        select_expr = expr.args.get("select")
+        if isinstance(select_expr, exp.Select):
+            for col_expr in select_expr.expressions:
+                if isinstance(col_expr, exp.Alias):
+                    name = col_expr.alias
+                elif isinstance(col_expr, exp.Column):
+                    name = col_expr.name
+                else:
+                    continue
+                if name and name not in columns and name != "*":
+                    sql_tags: list[str] = []
+                    if any(p in name.lower() for p in PII_PATTERNS):
+                        sql_tags.append("pii")
+                    columns[name] = ColumnInfo(
+                        name=name,
+                        tags=sql_tags,
+                        confidence=0.65,
+                    )
+    return list(columns.values())
+
+
+def _infer_joins(
+    model: DiscoveredModel,
+    name_lookup: dict[str, str],
+) -> list[JoinPath]:
+    """Infer join paths from YAML relationship tests and SQL JOIN/WHERE clauses."""
+    joins: dict[str, JoinPath] = {}
+    # YAML relationship tests (highest confidence)
+    for rel in model.yaml_relationship_tests:
+        target = name_lookup.get(rel["to_table"], rel["to_table"])
+        key = f"{target}:{rel['from_column']}={rel['to_column']}"
+        if key not in joins:
+            joins[key] = JoinPath(
+                to_table=target,
+                on=[(rel["from_column"], rel["to_column"])],
+                confidence=0.95,
+            )
+    # SQL JOIN ON clauses
+    cleaned = _clean_sql_for_parsing(model.sql_text)
+    try:
+        expr = parse_one(cleaned, error_level=ErrorLevel.IGNORE)
+    except ParseError:
+        expr = None
+    if expr is not None:
+        for join_expr in expr.find_all(exp.Join):
+            join_on = join_expr.args.get("on")
+            if not isinstance(join_on, exp.EQ):
+                continue
+            join_table_expr = join_expr.find(exp.Table)
+            if join_table_expr is None:
+                continue
+            raw_target = join_table_expr.name
+            target = name_lookup.get(raw_target, raw_target)
+            left_col = _safe_expression_sql(join_on.left)
+            right_col = _safe_expression_sql(join_on.right)
+            if left_col and right_col:
+                left_name = _normalize_identifier(left_col)
+                right_name = _normalize_identifier(right_col)
+                join_type_val = join_expr.side if hasattr(join_expr, "side") else None
+                key = f"{target}:{left_name}={right_name}"
+                if key not in joins:
+                    joins[key] = JoinPath(
+                        to_table=target,
+                        on=[(left_name, right_name)],
+                        type=str(join_type_val).lower() if join_type_val else None,
+                        confidence=0.85,
+                    )
+    return list(joins.values())
+
+
+def _extract_query_patterns(
+    table: str,
+    all_models: list[DiscoveredModel],
+    downstream_tables: list[str],
+    name_lookup: dict[str, str],
+) -> tuple[list[QueryPattern], dict[str, int]]:
+    """Extract query patterns from downstream models that reference this table."""
+    patterns: list[QueryPattern] = []
+    column_counts: dict[str, int] = defaultdict(int)
+    downstream_set = set(downstream_tables)
+    for model in all_models:
+        if model.table not in downstream_set:
+            continue
+        # Check if this model actually references our table
+        cleaned = _clean_sql_for_parsing(model.sql_text)
+        short_name = table.split(".")[-1]
+        if short_name not in model.sql_text and table not in model.sql_text:
+            continue
+        try:
+            expr = parse_one(cleaned, error_level=ErrorLevel.IGNORE)
+        except ParseError:
+            continue
+        if expr is None:
+            continue
+        # Extract columns used
+        cols_used: list[str] = []
+        select_expr = expr.args.get("select")
+        if isinstance(select_expr, exp.Select):
+            for col_expr in select_expr.expressions:
+                if isinstance(col_expr, exp.Alias):
+                    col_name = col_expr.alias
+                elif isinstance(col_expr, exp.Column):
+                    col_name = col_expr.name
+                else:
+                    continue
+                if col_name and col_name != "*":
+                    cols_used.append(col_name)
+                    column_counts[col_name] += 1
+        # Extract filters
+        filters_found: list[str] = []
+        for where in expr.find_all(exp.Where):
+            clause_sql = _safe_expression_sql(where.this)
+            if clause_sql:
+                filters_found.append(clause_sql[:120])
+        # Extract joins used
+        joins_found: list[str] = []
+        for join_expr in expr.find_all(exp.Join):
+            join_sql = _safe_expression_sql(join_expr)
+            if join_sql:
+                joins_found.append(join_sql[:120])
+        patterns.append(
+            QueryPattern(
+                source_model=model.table,
+                columns_used=cols_used,
+                joins=joins_found,
+                filters=filters_found,
+            )
+        )
+    # Sort by most columns used, cap at 5
+    patterns.sort(key=lambda p: len(p.columns_used), reverse=True)
+    return patterns[:5], dict(column_counts)
 
 
 def _build_brief(
@@ -281,6 +461,7 @@ def _build_brief(
     normalized_deps: dict[str, list[str]],
     downstream: dict[str, list[str]],
     grain_lookup: dict[str, str | None],
+    name_lookup: dict[str, str],
 ) -> TableBrief:
     purpose, purpose_score = _infer_purpose(model)
     grain, grain_score, grain_evidence = _infer_grain(model)
@@ -293,6 +474,14 @@ def _build_brief(
     alternatives_score = 0.8 if alternatives else 0.0
     filters_score = 0.9 if model.filters else 0.0
     freshness_score = 0.9 if model.freshness_hints else 0.0
+
+    columns = _extract_columns(model)
+    columns_score = max((c.confidence for c in columns), default=0.0) if columns else 0.0
+    joins = _infer_joins(model, name_lookup)
+    joins_score = max((j.confidence for j in joins), default=0.0) if joins else 0.0
+    query_patterns, column_usage = _extract_query_patterns(
+        model.table, all_models, downstream_usage, name_lookup
+    )
 
     field_evidence: dict[str, list[EvidenceRef]] = {
         "purpose": model.purpose_evidence if purpose else [],
@@ -313,6 +502,8 @@ def _build_brief(
         "freshness_hints": freshness_score,
         "downstream_usage": downstream_score,
         "alternatives": alternatives_score,
+        "columns": columns_score,
+        "joins": joins_score,
     }
     confidence = _compute_confidence(
         purpose_score,
@@ -339,6 +530,10 @@ def _build_brief(
         field_confidence=field_confidence,
         evidence=evidence,
         field_evidence=field_evidence,
+        columns=columns,
+        joins=joins,
+        query_patterns=query_patterns,
+        column_usage=column_usage,
     )
 
 
@@ -625,11 +820,37 @@ def _yaml_entry_to_metadata(path: Path, relative_path: str, entry: dict[str, Any
         column_name = column.get("name")
         if not isinstance(column_name, str):
             continue
+        col_desc = column.get("description")
+        col_tags: list[str] = []
+        if isinstance(column.get("tags"), list):
+            col_tags = [str(t) for t in column["tags"] if isinstance(t, str)]
+        metadata.column_meta.append(
+            YamlColumnMeta(
+                name=column_name,
+                description=col_desc if isinstance(col_desc, str) else None,
+                tags=col_tags,
+            )
+        )
         for test in column.get("tests", []):
             if test == "unique":
                 metadata.unique_columns.add(column_name)
             if test == "not_null":
                 metadata.not_null_columns.add(column_name)
+            if isinstance(test, dict):
+                rel = test.get("relationships")
+                if isinstance(rel, dict):
+                    to_val = rel.get("to")
+                    to_field = rel.get("field")
+                    if isinstance(to_val, str) and isinstance(to_field, str):
+                        ref_match = DBT_REF_RE.search(to_val)
+                        target_table = ref_match.group(1) if ref_match else to_val
+                        metadata.relationship_tests.append(
+                            {
+                                "from_column": column_name,
+                                "to_table": target_table,
+                                "to_column": to_field,
+                            }
+                        )
     return metadata
 
 
@@ -642,6 +863,12 @@ def _merge_yaml_metadata(left: YamlMetadata, right: YamlMetadata) -> YamlMetadat
     merged.unique_columns = left.unique_columns | right.unique_columns
     merged.not_null_columns = left.not_null_columns | right.not_null_columns
     merged.composite_keys = left.composite_keys + right.composite_keys
+    seen_cols: set[str] = set()
+    for col in left.column_meta + right.column_meta:
+        if col.name not in seen_cols:
+            merged.column_meta.append(col)
+            seen_cols.add(col.name)
+    merged.relationship_tests = left.relationship_tests + right.relationship_tests
     return merged
 
 
@@ -973,3 +1200,126 @@ def _iter_files(root: Path, suffixes: set[str], include_target: bool = True) -> 
                 continue
         results.append(path)
     return sorted(results)
+
+
+def enrich_from_db(
+    catalog: Catalog,
+    dsn: str,
+) -> Catalog:
+    """Enrich a catalog with live database metadata via SQLAlchemy.
+
+    Merges column types, FK-based join paths, and row counts
+    into the locally scanned briefs. DSN is never persisted.
+    """
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy import inspect as sa_inspect
+    except ImportError:
+        import warnings
+
+        warnings.warn(
+            "sqlalchemy is required for --dsn enrichment. "
+            'Install with: uv pip install "agent-table-brief[db]"',
+            stacklevel=2,
+        )
+        return catalog
+
+    try:
+        engine = create_engine(dsn)
+        inspector = sa_inspect(engine)
+    except Exception as exc:
+        import warnings
+
+        warnings.warn(
+            f"Database connection failed, continuing with local-only: {exc}",
+            stacklevel=2,
+        )
+        return catalog
+
+    brief_lookup = {b.table: b for b in catalog.briefs}
+    schemas = inspector.get_schema_names()
+    for schema in schemas:
+        try:
+            table_names = inspector.get_table_names(schema=schema)
+        except Exception:
+            continue
+        for db_table in table_names:
+            fq_name = f"{schema}.{db_table}"
+            brief = brief_lookup.get(fq_name) or brief_lookup.get(
+                db_table
+            )
+            if brief is None:
+                continue
+            # Enrich columns with DB types
+            try:
+                db_columns = inspector.get_columns(
+                    db_table, schema=schema
+                )
+            except Exception:
+                db_columns = []
+            col_lookup = {c.name: c for c in brief.columns}
+            for db_col in db_columns:
+                col_name = str(db_col["name"])
+                db_type = str(db_col.get("type", ""))
+                if col_name in col_lookup:
+                    col_lookup[col_name].type = db_type
+                else:
+                    brief.columns.append(
+                        ColumnInfo(
+                            name=col_name,
+                            type=db_type,
+                            confidence=0.99,
+                        )
+                    )
+            # Enrich joins from FK constraints
+            try:
+                fks = inspector.get_foreign_keys(
+                    db_table, schema=schema
+                )
+            except Exception:
+                fks = []
+            existing_targets = {
+                j.to_table for j in brief.joins
+            }
+            for fk in fks:
+                ref_table = str(fk.get("referred_table", ""))
+                ref_schema = fk.get("referred_schema", schema)
+                fq_ref = (
+                    f"{ref_schema}.{ref_table}"
+                    if ref_schema
+                    else ref_table
+                )
+                if fq_ref in existing_targets:
+                    continue
+                local_cols = [
+                    str(c) for c in fk.get("constrained_columns", [])
+                ]
+                ref_cols = [
+                    str(c) for c in fk.get("referred_columns", [])
+                ]
+                if local_cols and ref_cols:
+                    brief.joins.append(
+                        JoinPath(
+                            to_table=fq_ref,
+                            on=list(zip(local_cols, ref_cols, strict=False)),
+                            confidence=0.99,
+                        )
+                    )
+            # Row count as freshness hint
+            try:
+                from sqlalchemy import text
+
+                with engine.connect() as conn:
+                    quoted = f'"{schema}"."{db_table}"'
+                    row = conn.execute(
+                        text(f"SELECT COUNT(*) FROM {quoted}")
+                    ).fetchone()
+                    if row:
+                        count = int(row[0])
+                        hint = f"~{count:,} rows"
+                        if hint not in brief.freshness_hints:
+                            brief.freshness_hints.append(hint)
+            except Exception:
+                pass
+
+    return catalog

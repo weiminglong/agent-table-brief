@@ -20,7 +20,11 @@ mcp = FastMCP(
     instructions=(
         "tablebrief provides table-level context for analytics repositories. "
         "Use search_tables to find tables by intent, get_brief for full detail "
-        "on a specific table, compare_tables to diff similar tables, "
+        "on a specific table (includes columns, joins, query patterns), "
+        "get_columns for column metadata with PII tags, "
+        "get_join_path for the shortest join between two tables, "
+        "get_lineage for upstream/downstream dependency tracing, "
+        "compare_tables to diff similar tables, "
         "list_tables for a catalog overview, and list_repos to see scanned repositories. "
         "All data comes from a local scan — no warehouse connection required."
     ),
@@ -166,6 +170,92 @@ def list_repos() -> dict[str, Any]:
         store = _store()
         summaries = store.list_repos()
         return {"repos": [s.model_dump(mode="json") for s in summaries]}
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool()
+def get_columns(
+    table: str, repo: str | None = None
+) -> dict[str, Any]:
+    """Get column metadata for a specific table.
+
+    Returns a list of columns with name, type, description, tags
+    (including PII sensitivity), and confidence score. Use this
+    before writing SQL to understand what columns are available
+    and their meaning.
+
+    Args:
+        table: Table name, e.g. "mart.daily_active_users".
+        repo: Path to the scanned repository. Omit to use cwd.
+    """
+    try:
+        store = _store()
+        repo_path = Path(repo) if repo else None
+        brief = store.load_brief(table, repo_path=repo_path)
+        return {
+            "table": brief.table,
+            "columns": [c.model_dump(mode="json") for c in brief.columns],
+        }
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool()
+def get_join_path(
+    table_a: str,
+    table_b: str,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """Find the shortest join path between two tables.
+
+    Uses BFS over inferred join relationships (from FK constraints,
+    dbt relationship tests, and SQL JOIN clauses). Returns the
+    sequence of tables and join conditions to traverse.
+
+    Args:
+        table_a: Starting table name.
+        table_b: Target table name.
+        repo: Path to the scanned repository. Omit to use cwd.
+    """
+    try:
+        store = _store()
+        repo_path = Path(repo) if repo else None
+        result = store.find_join_path(table_a, table_b, repo_path=repo_path)
+        return result.model_dump(mode="json")
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool()
+def get_lineage(
+    table: str,
+    direction: str = "both",
+    depth: int | None = None,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """Trace multi-hop lineage for a table.
+
+    Returns upstream dependencies, downstream consumers, or both.
+    Each node includes the table name, depth (hops from origin),
+    and direction. Use this to understand data flow and impact.
+
+    Args:
+        table: Table name to trace lineage from.
+        direction: "upstream", "downstream", or "both".
+        depth: Maximum traversal depth. Omit for default (10).
+        repo: Path to the scanned repository. Omit to use cwd.
+    """
+    try:
+        store = _store()
+        repo_path = Path(repo) if repo else None
+        result = store.build_lineage(
+            table,
+            direction=direction,
+            max_depth=depth,
+            repo_path=repo_path,
+        )
+        return result.model_dump(mode="json")
     except Exception as e:
         return _handle_error(e)
 

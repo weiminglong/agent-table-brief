@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -15,6 +16,10 @@ from typing import Any, cast
 from agent_table_brief.models import (
     Catalog,
     EvidenceRef,
+    JoinPathResult,
+    JoinPathStep,
+    LineageNode,
+    LineageResult,
     MaintenanceResult,
     RepoSummary,
     ScanResult,
@@ -232,6 +237,162 @@ class CatalogStore:
         ]
         return SearchResult(query=query, hits=hits)
 
+    def find_join_path(
+        self,
+        table_a: str,
+        table_b: str,
+        repo_path: Path | None = None,
+        max_depth: int = 5,
+    ) -> JoinPathResult:
+        repo_row = self._resolve_repo_row(repo_path)
+        scan_row = self._active_scan_row(repo_row["id"])
+        scan_id = int(scan_row["id"])
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH RECURSIVE paths(current_table, target_table, depth, visited, path_json) AS (
+                    SELECT
+                        source_table,
+                        target_table,
+                        1,
+                        source_table || '|' || target_table,
+                        json_array(json_object(
+                            'from_table', source_table,
+                            'to_table', target_table,
+                            'on_json', on_json,
+                            'join_type', join_type,
+                            'confidence', confidence
+                        ))
+                    FROM joins
+                    WHERE scan_id = ? AND source_table = ?
+                    UNION ALL
+                    SELECT
+                        j.source_table,
+                        j.target_table,
+                        p.depth + 1,
+                        p.visited || '|' || j.target_table,
+                        json_insert(p.path_json, '$[#]', json_object(
+                            'from_table', j.source_table,
+                            'to_table', j.target_table,
+                            'on_json', j.on_json,
+                            'join_type', j.join_type,
+                            'confidence', j.confidence
+                        ))
+                    FROM joins j
+                    JOIN paths p ON j.source_table = p.target_table
+                    WHERE j.scan_id = ?
+                      AND p.visited NOT LIKE '%' || j.target_table || '%'
+                      AND p.depth < ?
+                )
+                SELECT path_json
+                FROM paths
+                WHERE target_table = ?
+                ORDER BY depth ASC
+                LIMIT 1
+                """,
+                (scan_id, table_a, scan_id, max_depth, table_b),
+            ).fetchone()
+        if rows is None:
+            return JoinPathResult(from_table=table_a, to_table=table_b, found=False)
+        steps_raw = json.loads(str(rows["path_json"]))
+        steps = [
+            JoinPathStep(
+                from_table=s["from_table"],
+                to_table=s["to_table"],
+                on=[tuple(pair) for pair in json.loads(s["on_json"])],
+                join_type=s["join_type"],
+                confidence=float(s["confidence"]),
+            )
+            for s in steps_raw
+        ]
+        return JoinPathResult(
+            from_table=table_a,
+            to_table=table_b,
+            path=steps,
+            found=True,
+        )
+
+    def build_lineage(
+        self,
+        table: str,
+        direction: str = "both",
+        max_depth: int | None = None,
+        repo_path: Path | None = None,
+    ) -> LineageResult:
+        repo_row = self._resolve_repo_row(repo_path)
+        scan_row = self._active_scan_row(repo_row["id"])
+        scan_id = int(scan_row["id"])
+        effective_depth = max_depth if max_depth is not None else 10
+        nodes: list[LineageNode] = []
+        with self._connect() as connection:
+            if direction in ("upstream", "both"):
+                upstream_rows = connection.execute(
+                    """
+                    WITH RECURSIVE lineage(tbl, depth) AS (
+                        SELECT table_name, 0
+                        FROM briefs WHERE scan_id = ? AND table_name = ?
+                        UNION
+                        SELECT
+                            b2.table_name,
+                            l.depth + 1
+                        FROM lineage l
+                        JOIN briefs b ON b.scan_id = ? AND b.table_name = l.tbl
+                        CROSS JOIN briefs b2
+                        WHERE b2.scan_id = ?
+                          AND l.depth < ?
+                          AND json_extract(
+                              b.payload_json, '$.derived_from'
+                          ) LIKE '%' || b2.table_name || '%'
+                          AND b2.table_name != l.tbl
+                    )
+                    SELECT tbl, MIN(depth) as depth FROM lineage WHERE depth > 0
+                    GROUP BY tbl
+                    """,
+                    (scan_id, table, scan_id, scan_id, effective_depth),
+                ).fetchall()
+                for row in upstream_rows:
+                    nodes.append(LineageNode(
+                        table=str(row["tbl"]),
+                        depth=int(row["depth"]),
+                        direction="upstream",
+                    ))
+            if direction in ("downstream", "both"):
+                downstream_rows = connection.execute(
+                    """
+                    WITH RECURSIVE lineage(tbl, depth) AS (
+                        SELECT table_name, 0
+                        FROM briefs WHERE scan_id = ? AND table_name = ?
+                        UNION
+                        SELECT
+                            b2.table_name,
+                            l.depth + 1
+                        FROM lineage l
+                        JOIN briefs b2 ON b2.scan_id = ?
+                        WHERE l.depth < ?
+                          AND json_extract(
+                              b2.payload_json, '$.derived_from'
+                          ) LIKE '%' || l.tbl || '%'
+                          AND b2.table_name != l.tbl
+                    )
+                    SELECT tbl, MIN(depth) as depth FROM lineage WHERE depth > 0
+                    GROUP BY tbl
+                    """,
+                    (scan_id, table, scan_id, effective_depth),
+                ).fetchall()
+                for row in downstream_rows:
+                    nodes.append(LineageNode(
+                        table=str(row["tbl"]),
+                        depth=int(row["depth"]),
+                        direction="downstream",
+                    ))
+        nodes.sort(key=lambda n: (n.depth, n.table))
+        return LineageResult(
+            origin=table,
+            direction=direction,
+            max_depth=max_depth,
+            nodes=nodes,
+        )
+
     def list_repos(self) -> list[RepoSummary]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -345,6 +506,31 @@ class CatalogStore:
                     PRIMARY KEY (scan_id, relative_path)
                 );
 
+                CREATE TABLE IF NOT EXISTS columns (
+                    scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    table_name TEXT NOT NULL,
+                    column_name TEXT NOT NULL,
+                    column_type TEXT,
+                    description TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    PRIMARY KEY (scan_id, table_name, column_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS joins (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    source_table TEXT NOT NULL,
+                    target_table TEXT NOT NULL,
+                    on_json TEXT NOT NULL DEFAULT '[]',
+                    join_type TEXT,
+                    confidence REAL NOT NULL DEFAULT 0.0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_columns_scan_table ON columns(scan_id, table_name);
+                CREATE INDEX IF NOT EXISTS idx_joins_scan_source ON joins(scan_id, source_table);
+                CREATE INDEX IF NOT EXISTS idx_joins_scan_target ON joins(scan_id, target_table);
+
                 CREATE INDEX IF NOT EXISTS idx_repos_effective_root ON repos(effective_root);
                 CREATE INDEX IF NOT EXISTS idx_scans_repo_generated_at
                 ON scans(repo_id, generated_at DESC);
@@ -361,6 +547,7 @@ class CatalogStore:
                     grain,
                     filters,
                     alternatives,
+                    column_names,
                     tokenize='unicode61'
                 );
                 """
@@ -484,8 +671,47 @@ class CatalogStore:
             """,
             evidence_rows,
         )
-        fts_rows: list[tuple[int, str, str | None, str | None, str, str]] = []
+        column_rows: list[tuple[int, str, str, str | None, str | None, str, float]] = []
+        join_rows: list[tuple[int, str, str, str, str | None, float]] = []
         for brief in briefs:
+            for col in brief.columns:
+                column_rows.append(
+                    (
+                        scan_id,
+                        brief.table,
+                        col.name,
+                        col.type,
+                        col.description,
+                        json.dumps(col.tags),
+                        col.confidence,
+                    )
+                )
+            for jp in brief.joins:
+                join_rows.append(
+                    (
+                        scan_id,
+                        brief.table,
+                        jp.to_table,
+                        json.dumps(jp.on),
+                        jp.type,
+                        jp.confidence,
+                    )
+                )
+        if column_rows:
+            connection.executemany(
+                "INSERT INTO columns (scan_id, table_name, column_name, column_type,"
+                " description, tags_json, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                column_rows,
+            )
+        if join_rows:
+            connection.executemany(
+                "INSERT INTO joins (scan_id, source_table, target_table, on_json,"
+                " join_type, confidence) VALUES (?, ?, ?, ?, ?, ?)",
+                join_rows,
+            )
+        fts_rows: list[tuple[int, str, str | None, str | None, str, str, str]] = []
+        for brief in briefs:
+            col_names = ", ".join(col.name for col in brief.columns)
             fts_rows.append(
                 (
                     scan_id,
@@ -494,11 +720,12 @@ class CatalogStore:
                     brief.grain,
                     ", ".join(brief.filters_or_exclusions),
                     ", ".join(brief.alternatives),
+                    col_names,
                 )
             )
         connection.executemany(
-            "INSERT INTO briefs_fts (scan_id, table_name, purpose, grain, filters, alternatives)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO briefs_fts (scan_id, table_name, purpose, grain, filters,"
+            " alternatives, column_names) VALUES (?, ?, ?, ?, ?, ?, ?)",
             fts_rows,
         )
 

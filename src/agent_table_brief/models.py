@@ -13,6 +13,28 @@ class EvidenceRef(BaseModel):
     kind: str
 
 
+class ColumnInfo(BaseModel):
+    name: str
+    type: str | None = None
+    description: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+
+
+class JoinPath(BaseModel):
+    to_table: str
+    on: list[tuple[str, str]] = Field(default_factory=list)
+    type: str | None = None
+    confidence: float = 0.0
+
+
+class QueryPattern(BaseModel):
+    source_model: str
+    columns_used: list[str] = Field(default_factory=list)
+    joins: list[str] = Field(default_factory=list)
+    filters: list[str] = Field(default_factory=list)
+
+
 class TableBrief(BaseModel):
     table: str
     purpose: str | None = None
@@ -27,6 +49,10 @@ class TableBrief(BaseModel):
     field_confidence: dict[str, float] = Field(default_factory=dict)
     evidence: list[EvidenceRef] = Field(default_factory=list)
     field_evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict, exclude=True)
+    columns: list[ColumnInfo] = Field(default_factory=list)
+    joins: list[JoinPath] = Field(default_factory=list)
+    query_patterns: list[QueryPattern] = Field(default_factory=list)
+    column_usage: dict[str, int] = Field(default_factory=dict)
 
 
 class Catalog(BaseModel):
@@ -83,6 +109,34 @@ class SearchHit(BaseModel):
 class SearchResult(BaseModel):
     query: str
     hits: list[SearchHit]
+
+
+class JoinPathStep(BaseModel):
+    from_table: str
+    to_table: str
+    on: list[tuple[str, str]] = Field(default_factory=list)
+    join_type: str | None = None
+    confidence: float = 0.0
+
+
+class JoinPathResult(BaseModel):
+    from_table: str
+    to_table: str
+    path: list[JoinPathStep] = Field(default_factory=list)
+    found: bool = False
+
+
+class LineageNode(BaseModel):
+    table: str
+    depth: int
+    direction: str
+
+
+class LineageResult(BaseModel):
+    origin: str
+    direction: str
+    max_depth: int | None = None
+    nodes: list[LineageNode] = Field(default_factory=list)
 
 
 class CliError(BaseModel):

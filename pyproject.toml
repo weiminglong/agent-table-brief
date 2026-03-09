@@ -38,6 +38,7 @@ Repository = "https://github.com/weiminglong/agent-table-brief"
 Issues = "https://github.com/weiminglong/agent-table-brief/issues"
 
 [project.optional-dependencies]
+db = ["sqlalchemy>=2.0.0"]
 mcp = ["mcp>=1.0.0"]
 
 [dependency-groups]
@@ -69,4 +70,12 @@ disallow_untyped_decorators = false
 
 [[tool.mypy.overrides]]
 module = "mcp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sqlalchemy"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sqlalchemy.*"
 ignore_missing_imports = true

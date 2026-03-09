@@ -1,13 +1,17 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  agent-table-brief is a local-first CLI that scans analytics repositories and builds compact,
+  evidence-backed table briefs for coding agents and humans.
+
+  Stack: Python 3.12+, uv, typer, pydantic, sqlglot, PyYAML, mcp (optional), pytest/ruff/mypy.
+
+  Conventions:
+  - The public CLI is `tablebrief`.
+  - Runtime state is stored in a local SQLite database under TABLEBRIEF_HOME or the platform state directory.
+  - Output should stay compact, deterministic, and agent-friendly.
+  - Evidence must always point back to concrete files and line ranges.
+  - Heuristics should prefer empty fields over speculative text.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.

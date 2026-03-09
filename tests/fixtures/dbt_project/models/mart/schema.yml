@@ -10,9 +10,18 @@ models:
             - user_id
     columns:
       - name: activity_date
+        description: Date of user activity
         tests: [not_null]
       - name: user_id
-        tests: [not_null]
+        description: Unique user identifier
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_users')
+              field: user_id
+      - name: email
+        description: User email address
+        tags: [pii]
   - name: daily_active_users_all
     description: Daily active users including employees
   - name: dim_users
